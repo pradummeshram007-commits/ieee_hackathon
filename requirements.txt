@@ -1,0 +1,11 @@
+# KisanRoute runtime dependencies -- these four and nothing else.
+# Version floors are the ones this build was developed and tested against;
+# the upper bounds keep a surprise major release from breaking a deploy.
+#
+# Tested on Python 3.12.3 with: fastapi 0.142.2, uvicorn 0.54.0,
+# pydantic 2.13.5, ortools 9.15.6755.
+
+fastapi>=0.110,<1.0
+uvicorn>=0.27,<1.0
+pydantic>=2.6,<3.0
+ortools>=9.10,<10.0
