@@ -1,100 +1,95 @@
 """KisanRoute HTTP API.
 
-One FastAPI app, one process, all state in memory. Endpoints:
+One FastAPI app, one process, state shared by every session through SQLite (or
+PostgreSQL when ``DATABASE_URL`` is set).
 
-===========================  ==========================================
-``GET  /health``             liveness probe
-``GET  /api/dataset``        current farmers, buyers, trucks, crops
-``POST /api/farmers``        add a farmer
-``POST /api/buyers``         add a buyer
-``POST /api/plan``           plan with the optimiser, the greedy baseline, or both
-``POST /api/disrupt``        mutate state, re-plan, and diff against the old plan
-``POST /api/reset``          rebuild the seed dataset
-``GET  /``                   static frontend from ``app/static``
-===========================  ==========================================
+**Authentication.** Every ``/api`` route except ``/api/auth/login`` and
+``/api/auth/register`` needs ``Authorization: Bearer <token>``; ``/health`` is
+open so a platform health check works without credentials.
 
-Concurrency: the planners are CPU-bound and the state is a plain Python
-object, so the planning endpoints are declared ``def`` (Starlette runs them in
-its thread pool, keeping the event loop responsive) and every read-modify-plan
-sequence is taken under a single process-wide lock. Run with one worker; the
-state is per-process by design.
+**Authorisation is enforced here and in app/workflow.py, never in the browser.**
+A farmer's own view is assembled from their username, so another farmer's
+payout is not filtered out of the response -- it was never in it. Endpoints
+that take an id check the caller and return 403.
+
+Route groups:
+
+============================  ===============================================
+``/health``                   liveness, unauthenticated
+``/api/auth/*``               register, login, logout, whoami
+``/api/me/state``             the role-scoped payload every view polls
+``/api/me/lots``              a farmer lists produce
+``/api/me/demand``            a buyer posts demand
+``/api/trips/*``              accept / decline / pick up / deliver
+``/api/farmers/{id}``         one lot with its payout (self or coordinator)
+``/api/dataset|plan|disrupt|reset``   coordinator dashboard, unchanged shapes
+``/``                         static frontend
+============================  ===============================================
 """
 
 from __future__ import annotations
 
 import os
-import threading
 from pathlib import Path
 from typing import Dict, List, Optional
 
-from fastapi import Body, FastAPI, HTTPException
+from contextlib import asynccontextmanager
+
+from fastapi import Body, Depends, FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
-from . import __version__, baseline, metrics
+from . import __version__, auth, baseline, metrics, workflow
+from . import db as database
 from .models import (
+    AuthResponse,
     Buyer,
     BuyerCreate,
     Dataset,
     DatasetResponse,
+    DemandUpdate,
     DisruptRequest,
     DisruptResponse,
     DisruptionType,
     Farmer,
     FarmerCreate,
+    LoginRequest,
+    LotCreate,
+    LotPriceUpdate,
+    NotificationsRead,
     PlanMode,
     PlanRequest,
     PlanResponse,
     PlanResult,
+    RegisterRequest,
+    Role,
+    UserPublic,
 )
-from .seed import DEFAULT_SEED, build_dataset, default_price_for
-from .solver import solve
+from .seed import DEMO_PASSWORD, default_price_for
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 
-#: Default pickup-window length for a farmer added through the API without one.
 DEFAULT_PICKUP_WINDOW_MIN = 360
 DEFAULT_PACK_TIME_MIN = 30
 
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    """Create tables, load or seed the world, and plan once before serving."""
+    workflow.bootstrap()
+    yield
 
-class AppState:
-    """Everything the service remembers between requests."""
-
-    def __init__(self, seed: int = DEFAULT_SEED) -> None:
-        self.seed = seed
-        self.dataset: Dataset = build_dataset(seed)
-        self.last_optimized: Optional[PlanResult] = None
-        self.last_baseline: Optional[PlanResult] = None
-        self.disruptions: List[str] = []
-
-    def reset(self, seed: Optional[int] = None) -> None:
-        self.seed = self.seed if seed is None else seed
-        self.dataset = build_dataset(self.seed)
-        self.last_optimized = None
-        self.last_baseline = None
-        self.disruptions = []
-
-    def invalidate_plans(self) -> None:
-        """Called whenever the dataset changes under a cached plan."""
-        self.last_optimized = None
-        self.last_baseline = None
-
-
-STATE = AppState()
-STATE_LOCK = threading.Lock()
 
 app = FastAPI(
+    lifespan=lifespan,
     title="KisanRoute",
     version=__version__,
     description=(
-        "Smallholder produce aggregation and pickup routing: groups nearby farmers "
-        "into truck routes that respect truck capacity, per-crop spoilage deadlines "
-        "and buyer delivery windows."
+        "Smallholder produce aggregation and pickup routing, with accounts: farmers "
+        "list lots, the platform proposes truck trips, drivers accept them, and every "
+        "session sees the same live plan."
     ),
 )
 
-# Open CORS: the frontend is served from the same origin in production but from
-# a dev server during the hackathon.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -105,27 +100,219 @@ app.add_middleware(
 
 
 # --------------------------------------------------------------------------- #
-# Health and dataset
+# Auth plumbing
+# --------------------------------------------------------------------------- #
+def current_user(token: str = Depends(auth.bearer_token)) -> UserPublic:
+    with database.session_scope() as db:
+        user = auth.user_for_token(db, token)
+        if user is None:
+            raise HTTPException(status_code=401, detail="invalid or expired token")
+        return auth.public_user(user)
+
+
+def require_coordinator(user: UserPublic = Depends(current_user)) -> UserPublic:
+    if user.role != Role.COORDINATOR:
+        raise HTTPException(
+            status_code=403,
+            detail=f"'{user.username}' is a {user.role.value}; this view is coordinator-only",
+        )
+    return user
+
+
+def _workflow_call(fn, *args, **kwargs):
+    """Run a workflow function, mapping its rule violations onto HTTP codes."""
+    try:
+        return fn(*args, **kwargs)
+    except workflow.WorkflowError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
+
+
+# --------------------------------------------------------------------------- #
+# Health and auth
 # --------------------------------------------------------------------------- #
 @app.get("/health", tags=["ops"])
-def health() -> Dict[str, str]:
-    return {"status": "ok"}
+def health() -> Dict[str, object]:
+    return {"status": "ok", "version": workflow.version(), "planning": workflow.is_planning()}
 
 
+@app.post("/api/auth/login", response_model=AuthResponse, tags=["auth"])
+def login(payload: LoginRequest) -> AuthResponse:
+    with database.session_scope() as db:
+        user = auth.authenticate(db, payload.username, payload.password)
+        if user is None:
+            raise HTTPException(status_code=401, detail="unknown username or wrong password")
+        token = auth.issue_token(db, user.username)
+        return AuthResponse(token=token, user=auth.public_user(user))
+
+
+@app.post("/api/auth/register", response_model=AuthResponse, status_code=201, tags=["auth"])
+def register(payload: RegisterRequest) -> AuthResponse:
+    """Farmer self-registration. The farm location comes from a map click."""
+    username = payload.username.strip().lower()
+    with database.session_scope() as db:
+        if database.get_user(db, username) is not None:
+            raise HTTPException(status_code=409, detail=f"username '{username}' is taken")
+        user = auth.create_user(
+            db,
+            username=username,
+            password=payload.password,
+            role=Role.FARMER.value,
+            ref_id=None,          # lots are created later and carry the link
+            display_name=payload.name.strip(),
+            village=payload.village.strip(),
+            phone=payload.phone.strip(),
+            lat=payload.lat,
+            lng=payload.lng,
+        )
+        token = auth.issue_token(db, user.username)
+        return AuthResponse(token=token, user=auth.public_user(user))
+
+
+@app.post("/api/auth/logout", tags=["auth"])
+def logout(token: str = Depends(auth.bearer_token)) -> Dict[str, object]:
+    with database.session_scope() as db:
+        return {"status": "logged_out", "existed": auth.revoke_token(db, token)}
+
+
+@app.get("/api/auth/me", response_model=UserPublic, tags=["auth"])
+def whoami(user: UserPublic = Depends(current_user)) -> UserPublic:
+    return user
+
+
+@app.get("/api/auth/demo-accounts", tags=["auth"])
+def demo_account_hints() -> Dict[str, object]:
+    """The one-click chips on the login screen. Demo scaffolding, not secrets."""
+    with workflow.read() as state:
+        farmer = next((f for f in state.dataset.farmers if f.owner == "f02"), None)
+        buyer = state.dataset.buyer_by_id("B1")
+        return {
+            "password": DEMO_PASSWORD,
+            "chips": [
+                {"username": "kiran", "role": "farmer", "label": "Kiran (new farmer)"},
+                {"username": "f02", "role": "farmer",
+                 "label": f"{farmer.name.split()[0]} (farmer)" if farmer else "Farmer"},
+                {"username": "t1", "role": "driver", "label": "T1"},
+                {"username": "t2", "role": "driver", "label": "T2"},
+                {"username": "t3", "role": "driver", "label": "T3"},
+                {"username": "t4", "role": "driver", "label": "T4"},
+                {"username": "b1", "role": "buyer",
+                 "label": f"{buyer.name.split()[0]} Retail (buyer)" if buyer else "Buyer"},
+                {"username": "admin", "role": "coordinator", "label": "Coordinator"},
+            ],
+        }
+
+
+# --------------------------------------------------------------------------- #
+# The live, role-scoped state every view polls
+# --------------------------------------------------------------------------- #
+@app.get("/api/me/state", tags=["live"])
+def me_state(
+    since: Optional[int] = Query(default=None, ge=0),
+    user: UserPublic = Depends(current_user),
+) -> Dict[str, object]:
+    """Poll target. Returns ``changed: false`` and no payload when nothing moved."""
+    return _workflow_call(workflow.state_envelope, user, since)
+
+
+@app.post("/api/me/lots", status_code=201, tags=["live"])
+def post_lot(payload: LotCreate, user: UserPublic = Depends(current_user)) -> Dict[str, object]:
+    lot = _workflow_call(workflow.post_lot, user, payload)
+    return {"lot": lot, "version": workflow.version(), "planning": workflow.is_planning()}
+
+
+@app.post("/api/me/demand", tags=["live"])
+def post_demand(payload: DemandUpdate, user: UserPublic = Depends(current_user)) -> Dict[str, object]:
+    buyer = _workflow_call(workflow.set_demand, user, payload)
+    return {"buyer": buyer, "version": workflow.version(), "planning": workflow.is_planning()}
+
+
+@app.post("/api/me/lots/{lot_id}/accept", tags=["live"])
+def accept_match(lot_id: str, user: UserPublic = Depends(current_user)) -> Dict[str, object]:
+    """The farmer takes their match. The trip confirms once everyone has."""
+    result = _workflow_call(workflow.accept_match, user, lot_id.upper())
+    return {**result, "version": workflow.version()}
+
+
+@app.post("/api/me/lots/{lot_id}/decline", tags=["live"])
+def decline_match(lot_id: str, user: UserPublic = Depends(current_user)) -> Dict[str, object]:
+    """Turn the match down: the lot is withdrawn and the rest is re-planned."""
+    result = _workflow_call(workflow.decline_match, user, lot_id.upper())
+    return {**result, "version": workflow.version(), "planning": workflow.is_planning()}
+
+
+@app.post("/api/me/lots/{lot_id}/price", tags=["live"])
+def set_lot_price(
+    lot_id: str, payload: LotPriceUpdate, user: UserPublic = Depends(current_user)
+) -> Dict[str, object]:
+    """Edit price. A lower floor can open up buyers, so this re-plans."""
+    lot = _workflow_call(workflow.set_lot_price, user, lot_id.upper(), payload.min_price_per_kg)
+    return {"lot": lot, "version": workflow.version(), "planning": workflow.is_planning()}
+
+
+@app.post("/api/me/notifications/read", tags=["live"])
+def read_notifications(
+    payload: NotificationsRead = Body(default=NotificationsRead()),
+    user: UserPublic = Depends(current_user),
+) -> Dict[str, object]:
+    marked = _workflow_call(workflow.mark_notifications_read, user, payload.ids)
+    return {"marked": marked, "version": workflow.version()}
+
+
+# --------------------------------------------------------------------------- #
+# Trips
+# --------------------------------------------------------------------------- #
+@app.get("/api/trips/{truck_id}", tags=["trips"])
+def get_trip(truck_id: str, user: UserPublic = Depends(current_user)) -> Dict[str, object]:
+    return _workflow_call(workflow.trip_detail, user, truck_id.upper())
+
+
+@app.post("/api/trips/{truck_id}/accept", tags=["trips"])
+def accept(truck_id: str, user: UserPublic = Depends(current_user)) -> Dict[str, object]:
+    trip = _workflow_call(workflow.accept_trip, user, truck_id.upper())
+    return {"trip": trip, "version": workflow.version()}
+
+
+@app.post("/api/trips/{truck_id}/decline", tags=["trips"])
+def decline(truck_id: str, user: UserPublic = Depends(current_user)) -> Dict[str, object]:
+    trip = _workflow_call(workflow.decline_trip, user, truck_id.upper())
+    return {"trip": trip, "version": workflow.version(), "planning": workflow.is_planning()}
+
+
+@app.post("/api/trips/{truck_id}/stops/{farmer_id}/pickup", tags=["trips"])
+def pickup(truck_id: str, farmer_id: str, user: UserPublic = Depends(current_user)) -> Dict[str, object]:
+    trip = _workflow_call(workflow.mark_picked_up, user, truck_id.upper(), farmer_id.upper())
+    return {"trip": trip, "version": workflow.version()}
+
+
+@app.post("/api/trips/{truck_id}/deliver", tags=["trips"])
+def deliver(truck_id: str, user: UserPublic = Depends(current_user)) -> Dict[str, object]:
+    trip = _workflow_call(workflow.mark_delivered, user, truck_id.upper())
+    return {"trip": trip, "version": workflow.version()}
+
+
+@app.get("/api/farmers/{farmer_id}", tags=["dataset"])
+def get_farmer(farmer_id: str, user: UserPublic = Depends(current_user)) -> Dict[str, object]:
+    """One lot with its payout. Self or coordinator only -- 403 for anyone else."""
+    return _workflow_call(workflow.farmer_detail, user, farmer_id.upper())
+
+
+# --------------------------------------------------------------------------- #
+# Coordinator dashboard (unchanged response shapes)
+# --------------------------------------------------------------------------- #
 @app.get("/api/dataset", response_model=DatasetResponse, tags=["dataset"])
-def get_dataset() -> DatasetResponse:
-    with STATE_LOCK:
-        dataset = STATE.dataset
+def get_dataset(user: UserPublic = Depends(require_coordinator)) -> DatasetResponse:
+    with workflow.read() as state:
         return DatasetResponse(
             summary={
-                **dataset.summary(),
-                "seed": STATE.seed,
-                "disruptions_applied": list(STATE.disruptions),
+                **state.dataset.summary(),
+                "seed": state.seed,
+                "disruptions_applied": list(state.disruptions),
+                "version": workflow.version(),
             },
-            crops=dataset.crops,
-            farmers=dataset.farmers,
-            buyers=dataset.buyers,
-            trucks=dataset.trucks,
+            crops=state.dataset.crops,
+            farmers=state.dataset.farmers,
+            buyers=state.dataset.buyers,
+            trucks=state.dataset.trucks,
         )
 
 
@@ -138,10 +325,12 @@ def _next_id(existing: List[str], prefix: str, width: int) -> str:
 
 
 @app.post("/api/farmers", status_code=201, tags=["dataset"])
-def add_farmer(payload: FarmerCreate) -> Dict[str, object]:
-    """Add a farmer. Harvest and pickup times default to "ready now"."""
-    with STATE_LOCK:
-        dataset = STATE.dataset
+def add_farmer(
+    payload: FarmerCreate, user: UserPublic = Depends(require_coordinator)
+) -> Dict[str, object]:
+    """Coordinator tool: add a lot directly, without an owning account."""
+    with workflow.mutate() as state:
+        dataset = state.dataset
         if payload.crop not in dataset.crops:
             raise HTTPException(
                 status_code=400,
@@ -153,13 +342,11 @@ def add_farmer(payload: FarmerCreate) -> Dict[str, object]:
 
         harvest_time = payload.harvest_time if payload.harvest_time is not None else 0
         ready_from = (
-            payload.ready_from
-            if payload.ready_from is not None
+            payload.ready_from if payload.ready_from is not None
             else harvest_time + DEFAULT_PACK_TIME_MIN
         )
         ready_until = (
-            payload.ready_until
-            if payload.ready_until is not None
+            payload.ready_until if payload.ready_until is not None
             else ready_from + DEFAULT_PICKUP_WINDOW_MIN
         )
         if ready_until < ready_from:
@@ -181,20 +368,26 @@ def add_farmer(payload: FarmerCreate) -> Dict[str, object]:
             ready_until=ready_until,
         )
         dataset.farmers.append(farmer)
-        STATE.invalidate_plans()
-        return {
-            "farmer": farmer,
-            "spoilage_deadline_min": dataset.spoilage_deadline(farmer),
-            "pickup_window": list(dataset.pickup_window(farmer)),
-            "dataset": dataset.summary(),
-        }
+        summary = dataset.summary()
+        deadline = dataset.spoilage_deadline(farmer)
+        window = list(dataset.pickup_window(farmer))
+
+    workflow.replan()
+    return {
+        "farmer": farmer,
+        "spoilage_deadline_min": deadline,
+        "pickup_window": window,
+        "dataset": summary,
+    }
 
 
 @app.post("/api/buyers", status_code=201, tags=["dataset"])
-def add_buyer(payload: BuyerCreate) -> Dict[str, object]:
-    """Add a buyer. Prices default to the usual premium for the buyer type."""
-    with STATE_LOCK:
-        dataset = STATE.dataset
+def add_buyer(
+    payload: BuyerCreate, user: UserPublic = Depends(require_coordinator)
+) -> Dict[str, object]:
+    """Coordinator tool: add a buyer. Prices default to the type's premium."""
+    with workflow.mutate() as state:
+        dataset = state.dataset
         unknown = [c for c in payload.crops_wanted if c not in dataset.crops]
         if unknown:
             raise HTTPException(
@@ -219,7 +412,6 @@ def add_buyer(payload: BuyerCreate) -> Dict[str, object]:
             prices = {
                 c: default_price_for(dataset.crops[c], payload.type) for c in payload.crops_wanted
             }
-        # Any wanted crop left without a price gets the type's default premium.
         for crop_name in payload.crops_wanted:
             prices.setdefault(crop_name, default_price_for(dataset.crops[crop_name], payload.type))
 
@@ -236,43 +428,43 @@ def add_buyer(payload: BuyerCreate) -> Dict[str, object]:
             window_end=payload.window_end,
         )
         dataset.buyers.append(buyer)
-        STATE.invalidate_plans()
-        return {"buyer": buyer, "dataset": dataset.summary()}
+        summary = dataset.summary()
 
-
-# --------------------------------------------------------------------------- #
-# Planning
-# --------------------------------------------------------------------------- #
-def _run_plans(dataset: Dataset, mode: PlanMode, time_limit_seconds: float):
-    """Run whichever planners ``mode`` asks for. Returns (optimized, baseline)."""
-    optimized = (
-        solve(dataset, time_limit_seconds=time_limit_seconds)
-        if mode in (PlanMode.OPTIMIZED, PlanMode.BOTH)
-        else None
-    )
-    greedy = baseline.plan(dataset) if mode in (PlanMode.BASELINE, PlanMode.BOTH) else None
-    return optimized, greedy
+    workflow.replan()
+    return {"buyer": buyer, "dataset": summary}
 
 
 @app.post("/api/plan", response_model=PlanResponse, tags=["planning"])
-def create_plan(payload: PlanRequest = Body(default=PlanRequest())) -> PlanResponse:
-    """Plan pickups. ``mode="both"`` also returns the full metric comparison."""
-    with STATE_LOCK:
-        dataset = STATE.dataset
-        optimized, greedy = _run_plans(dataset, payload.mode, payload.time_limit_seconds)
-        if optimized is not None:
-            STATE.last_optimized = optimized
-        if greedy is not None:
-            STATE.last_baseline = greedy
+def create_plan(
+    payload: PlanRequest = Body(default=PlanRequest()),
+    user: UserPublic = Depends(require_coordinator),
+) -> PlanResponse:
+    """Plan now, synchronously, honouring every accepted trip.
 
+    The baseline is deliberately *not* lock-aware: it is the "what if nobody
+    optimised anything" control, so it always replans the whole day from
+    scratch. That keeps the comparison meaningful rather than flattering.
+    """
+    if payload.mode in (PlanMode.OPTIMIZED, PlanMode.BOTH):
+        workflow.replan(blocking=True, time_limit=payload.time_limit_seconds)
+
+    with workflow.read() as state:
+        optimized: Optional[PlanResult] = (
+            state.plan if payload.mode in (PlanMode.OPTIMIZED, PlanMode.BOTH) else None
+        )
+        greedy: Optional[PlanResult] = (
+            (state.baseline or baseline.plan(state.dataset))
+            if payload.mode in (PlanMode.BASELINE, PlanMode.BOTH)
+            else None
+        )
         comparison = (
-            metrics.compare(dataset, greedy, optimized)
+            metrics.compare(state.dataset, greedy, optimized)
             if optimized is not None and greedy is not None
             else None
         )
         return PlanResponse(
             mode=payload.mode.value,
-            dataset=dataset.summary(),
+            dataset={**state.dataset.summary(), "version": workflow.version()},
             optimized=optimized,
             baseline=greedy,
             comparison=comparison,
@@ -309,13 +501,10 @@ def _apply_buyer_cancel(dataset: Dataset, target_id: str) -> str:
             detail="cannot cancel the only buyer; nothing could be delivered anywhere",
         )
     dataset.buyers.remove(buyer)
-    orphaned = [
-        f.id for f in dataset.farmers if not dataset.buyers_for_crop(f.crop)
-    ]
+    orphaned = [f.id for f in dataset.farmers if not dataset.buyers_for_crop(f.crop)]
     detail = (
         f" {len(orphaned)} lot(s) now have no outlet at all ({', '.join(orphaned)})."
-        if orphaned
-        else ""
+        if orphaned else ""
     )
     return (
         f"Buyer {buyer.id} ({buyer.name}) cancelled its order for "
@@ -328,14 +517,9 @@ def _apply_pickup_delay(dataset: Dataset, target_id: str, delay_minutes: Optiona
     if farmer is None:
         raise HTTPException(status_code=404, detail=f"no farmer '{target_id}'")
     if not delay_minutes:
-        raise HTTPException(
-            status_code=400, detail="pickup_delay needs a positive delay_minutes"
-        )
+        raise HTTPException(status_code=400, detail="pickup_delay needs a positive delay_minutes")
 
     old_window = dataset.pickup_window(farmer)
-    # The harvest itself slips, so the lot's whole timeline moves: it is cut
-    # later, it is ready later, and its spoilage clock starts later. What does
-    # *not* move is the buyer's delivery window, which is what makes this bite.
     farmer.harvest_time += delay_minutes
     farmer.ready_from += delay_minutes
     farmer.ready_until += delay_minutes
@@ -348,60 +532,78 @@ def _apply_pickup_delay(dataset: Dataset, target_id: str, delay_minutes: Optiona
 
 
 @app.post("/api/disrupt", response_model=DisruptResponse, tags=["planning"])
-def disrupt(payload: DisruptRequest) -> DisruptResponse:
-    """Apply a disruption, re-plan, and return the new plan plus a diff.
+def disrupt(
+    payload: DisruptRequest, user: UserPublic = Depends(require_coordinator)
+) -> DisruptResponse:
+    """Apply a disruption, re-plan, and diff against the plan that preceded it."""
+    with workflow.read() as state:
+        before = state.plan
+    if before is None:
+        workflow.replan(blocking=True, time_limit=payload.time_limit_seconds)
+        with workflow.read() as state:
+            before = state.plan
 
-    The "before" plan is the last optimised plan if one is cached; otherwise it
-    is computed on the pre-disruption state first, so a diff is always
-    meaningful even if this is the first call after a reset.
-    """
-    with STATE_LOCK:
-        dataset = STATE.dataset
-        before = STATE.last_optimized or solve(
-            dataset, time_limit_seconds=payload.time_limit_seconds
-        )
-
+    with workflow.mutate() as state:
+        dataset = state.dataset
         if payload.type == DisruptionType.TRUCK_BREAKDOWN:
             description = _apply_truck_breakdown(dataset, payload.target_id)
         elif payload.type == DisruptionType.BUYER_CANCEL:
             description = _apply_buyer_cancel(dataset, payload.target_id)
         else:
             description = _apply_pickup_delay(dataset, payload.target_id, payload.delay_minutes)
+        state.disruptions.append(f"{payload.type.value}:{payload.target_id}")
 
-        after = solve(dataset, time_limit_seconds=payload.time_limit_seconds)
-        greedy = baseline.plan(dataset)
-        STATE.last_optimized = after
-        STATE.last_baseline = greedy
-        STATE.disruptions.append(f"{payload.type.value}:{payload.target_id}")
+    workflow.replan(blocking=True, time_limit=payload.time_limit_seconds)
 
+    with workflow.read() as state:
+        after = state.plan
+        greedy = state.baseline or baseline.plan(state.dataset)
+        assert after is not None and before is not None
         return DisruptResponse(
             disruption=payload.type.value,
             target_id=payload.target_id,
             description=description,
-            dataset=dataset.summary(),
+            dataset={**state.dataset.summary(), "version": workflow.version()},
             plan=after,
             baseline=greedy,
-            comparison=metrics.compare(dataset, greedy, after),
-            diff=metrics.diff_plans(dataset, before, after),
+            comparison=metrics.compare(state.dataset, greedy, after),
+            diff=metrics.diff_plans(state.dataset, before, after),
         )
 
 
 @app.post("/api/reset", tags=["dataset"])
-def reset(seed: Optional[int] = Body(default=None, embed=True)) -> Dict[str, object]:
-    """Re-seed the dataset and drop every cached plan."""
-    with STATE_LOCK:
-        STATE.reset(seed)
-        return {
-            "status": "reset",
-            "seed": STATE.seed,
-            "dataset": STATE.dataset.summary(),
-        }
+def reset(
+    seed: Optional[int] = Body(default=None, embed=True),
+    user: UserPublic = Depends(require_coordinator),
+) -> Dict[str, object]:
+    """Re-seed the world: fresh dataset, no trips, no disruptions. Accounts stay."""
+    from .seed import build_dataset
+
+    with workflow.mutate() as state:
+        state.seed = state.seed if seed is None else seed
+        state.dataset = build_dataset(state.seed)
+        state.plan = None
+        state.baseline = None
+        state.trips = {}
+        # Notifications describe trips in the old world; after a re-seed they
+        # point at deals that no longer exist.
+        state.notifications = {}
+        state.disruptions = []
+        state.last_planned_at = None
+        summary = state.dataset.summary()
+        used_seed = state.seed
+
+    workflow.replan()
+    return {
+        "status": "reset",
+        "seed": used_seed,
+        "dataset": summary,
+        "version": workflow.version(),
+    }
 
 
 # --------------------------------------------------------------------------- #
-# Static frontend -- mounted last so the API routes above always win.
-# The directory is created if missing and an empty one is fine: "/" simply
-# 404s until a frontend is dropped in.
+# Static frontend -- mounted last so every API route above wins.
 # --------------------------------------------------------------------------- #
 STATIC_DIR.mkdir(parents=True, exist_ok=True)
 app.mount("/", StaticFiles(directory=str(STATIC_DIR), html=True), name="static")

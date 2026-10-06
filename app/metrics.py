@@ -145,6 +145,14 @@ def summarise(dataset: Dataset, plan: PlanResult, payout: Optional[PayoutSummary
     kg_spoiled = sum(s.quantity_kg for s in farmer_stops if s.minutes_past_deadline > 0)
     on_time = sum(1 for s in farmer_stops if s.minutes_past_deadline == 0)
 
+    # Produce that actually reaches a paying buyer in sound condition: on time,
+    # and to a buyer that wants the crop at the farmer's price. Raw kg_moved
+    # flatters any planner that collects produce it cannot sell.
+    kg_sellable = sum(
+        s.quantity_kg for s in farmer_stops
+        if s.minutes_past_deadline == 0 and s.crop_accepted
+    )
+
     fleet_capacity = dataset.total_capacity_kg()
     routes_on_time = sum(1 for r in plan.routes if r.delivery_on_time)
 
@@ -167,8 +175,13 @@ def summarise(dataset: Dataset, plan: PlanResult, payout: Optional[PayoutSummary
         if plan.routes
         else 100.0,
         kg_crop_mismatch=sum(r.kg_rejected for r in plan.routes),
+        kg_sellable=kg_sellable,
         km_per_tonne=round(_safe_div(plan.total_distance_km, plan.kg_moved / 1000.0), 2),
+        km_per_sellable_tonne=round(
+            _safe_div(plan.total_distance_km, kg_sellable / 1000.0), 2
+        ),
         cost_per_kg=round(_safe_div(plan.total_cost, plan.kg_moved), 2),
+        cost_per_sellable_kg=round(_safe_div(plan.total_cost, kg_sellable), 2),
         farmer_payout_total=payout.total_net,
         farmer_gain_vs_middleman=payout.total_gain,
     )
@@ -218,6 +231,9 @@ METRIC_SPEC = [
     ("deadlines_met_pct", "%", "deadlines_met_pct", HIGHER_IS_BETTER),
     ("buyer_windows_met_pct", "%", "buyer_windows_met_pct", HIGHER_IS_BETTER),
     ("kg_crop_mismatch", "kg", "kg_crop_mismatch", LOWER_IS_BETTER),
+    ("kg_sellable", "kg", "kg_sellable", HIGHER_IS_BETTER),
+    ("km_per_sellable_tonne", "km/t", "km_per_sellable_tonne", LOWER_IS_BETTER),
+    ("cost_per_sellable_kg", "INR/kg", "cost_per_sellable_kg", LOWER_IS_BETTER),
     ("capacity_utilisation_pct", "%", "capacity_utilisation_pct", HIGHER_IS_BETTER),
     ("km_per_tonne", "km/t", "km_per_tonne", LOWER_IS_BETTER),
     ("cost_per_kg", "INR/kg", "cost_per_kg", LOWER_IS_BETTER),
@@ -259,10 +275,20 @@ def _headline(baseline: PlanMetrics, optimized: PlanMetrics) -> List[str]:
     """A handful of sentences fit for a demo slide."""
     lines: List[str] = []
 
-    km_gain = _improvement_pct(baseline.total_km, optimized.total_km, LOWER_IS_BETTER)
+    # Raw distance compares a feasible plan with an infeasible one, so lead with
+    # distance per *sellable* tonne and report the raw figure alongside it.
+    sell_gain = _improvement_pct(
+        baseline.km_per_sellable_tonne, optimized.km_per_sellable_tonne, LOWER_IS_BETTER
+    )
     lines.append(
-        f"Distance: {optimized.total_km:,.1f} km optimised vs {baseline.total_km:,.1f} km greedy"
-        + (f" ({km_gain:+.1f}% better)" if km_gain is not None else "")
+        f"Distance per sellable tonne: {optimized.km_per_sellable_tonne:,.1f} km/t optimised "
+        f"vs {baseline.km_per_sellable_tonne:,.1f} km/t greedy"
+        + (f" ({sell_gain:+.1f}% better)" if sell_gain is not None else "")
+        + f"  [raw distance {optimized.total_km:,.1f} km vs {baseline.total_km:,.1f} km]"
+    )
+    lines.append(
+        f"Produce that reaches a paying buyer in good condition: "
+        f"{optimized.kg_sellable:,} kg vs {baseline.kg_sellable:,} kg"
     )
 
     cost_gain = _improvement_pct(baseline.total_cost, optimized.total_cost, LOWER_IS_BETTER)

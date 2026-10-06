@@ -46,6 +46,7 @@ from .models import (
     StopKind,
     Truck,
     UnservedFarmer,
+    UnservedReason,
     minutes_to_clock,
 )
 from .solver import SERVICE_TIME_MIN
@@ -57,7 +58,10 @@ def _point(obj) -> Point:
     return Point(obj.lat, obj.lng, getattr(obj, "id", ""))
 
 
-def _unserved(farmer: Farmer, reason: str) -> UnservedFarmer:
+def _unserved(
+    farmer: Farmer, reason: str, code: UnservedReason = UnservedReason.OTHER,
+    best_offer: Optional[float] = None,
+) -> UnservedFarmer:
     return UnservedFarmer(
         farmer_id=farmer.id,
         name=farmer.name,
@@ -65,7 +69,15 @@ def _unserved(farmer: Farmer, reason: str) -> UnservedFarmer:
         crop=farmer.crop,
         quantity_kg=farmer.quantity_kg,
         reason=reason,
+        reason_code=code,
+        best_offer_per_kg=best_offer if code == UnservedReason.PRICE else None,
+        min_price_per_kg=farmer.min_price_per_kg if code == UnservedReason.PRICE else None,
     )
+
+
+def _buyer_takes(buyer: Buyer, farmer: Farmer) -> bool:
+    """The one matching rule, applied here exactly as the solver applies it."""
+    return buyer.wants(farmer.crop) and buyer.price_for(farmer.crop) >= farmer.min_price_per_kg
 
 
 def _pick_buyer(
@@ -74,6 +86,7 @@ def _pick_buyer(
     load_by_crop: Counter,
     load_kg: int,
     remaining_demand: Dict[str, int],
+    picked: List[Farmer],
 ) -> Optional[Buyer]:
     """Nearest buyer wanting the truck's majority crop, demand permitting.
 
@@ -86,10 +99,18 @@ def _pick_buyer(
         return None
 
     majority_crop = max(load_by_crop.items(), key=lambda kv: (kv[1], kv[0]))[0]
-    wants_majority = [b for b in dataset.buyers if b.wants(majority_crop)]
+    # "Wants the crop" now means "wants it and will pay for the lots on board",
+    # scored by how many kilos this buyer could actually take.
+    wants_majority = [
+        b for b in dataset.buyers
+        if b.wants(majority_crop)
+        and any(_buyer_takes(b, f) for f in picked if f.crop == majority_crop)
+    ]
+    if not wants_majority:
+        wants_majority = [b for b in dataset.buyers if b.wants(majority_crop)]
     with_room = [b for b in wants_majority if remaining_demand.get(b.id, 0) >= load_kg]
     wants_anything = [
-        b for b in dataset.buyers if any(b.wants(crop) for crop in load_by_crop)
+        b for b in dataset.buyers if any(_buyer_takes(b, f) for f in picked)
     ]
 
     for candidates in (with_room, wants_majority, wants_anything, dataset.buyers):
@@ -132,7 +153,33 @@ def plan(dataset: Dataset, **_ignored) -> PlanResult:
             notes=["No buyer is accepting deliveries: nothing can be routed."],
         )
 
-    remaining: List[Farmer] = list(dataset.farmers)
+    # Even a naive planner does not collect produce nobody will buy at the
+    # farmer's price, so the price rule is applied here too -- otherwise the
+    # comparison would credit the baseline with kilos it could never sell.
+    remaining: List[Farmer] = []
+    unsellable: List[UnservedFarmer] = []
+    for farmer in dataset.active_farmers():
+        if dataset.buyers_for_lot(farmer):
+            remaining.append(farmer)
+        elif dataset.buyers_for_crop(farmer.crop):
+            unsellable.append(
+                _unserved(
+                    farmer,
+                    f"no buyer will pay {farmer.min_price_per_kg:.2f}/kg for "
+                    f"{farmer.crop.replace('_', ' ')} today",
+                    UnservedReason.PRICE,
+                    dataset.best_offer_for_crop(farmer.crop),
+                )
+            )
+        else:
+            unsellable.append(
+                _unserved(
+                    farmer,
+                    f"no buyer is accepting {farmer.crop} today",
+                    UnservedReason.NO_BUYER,
+                )
+            )
+
     remaining_demand: Dict[str, int] = {b.id: b.demand_kg for b in dataset.buyers}
     routes: List[RouteResult] = []
     notes: List[str] = []
@@ -142,11 +189,12 @@ def plan(dataset: Dataset, **_ignored) -> PlanResult:
         if route is not None:
             routes.append(route)
 
-    unserved = [
+    unserved = unsellable + [
         _unserved(
             f,
             "greedy fleet ran out of capacity before reaching this lot "
             f"({f.quantity_kg} kg did not fit in any remaining truck)",
+            UnservedReason.CAPACITY,
         )
         for f in remaining
     ]
@@ -270,7 +318,7 @@ def _greedy_route(
     if not picked:
         return None  # truck never left the yard
 
-    buyer = _pick_buyer(dataset, position, load_by_crop, load_kg, remaining_demand)
+    buyer = _pick_buyer(dataset, position, load_by_crop, load_kg, remaining_demand, picked)
     assert buyer is not None  # dataset.buyers is non-empty by the time we get here
 
     leg_m = road_distance_m(position, _point(buyer))
@@ -278,7 +326,7 @@ def _greedy_route(
     arrival_at_buyer = clock + travel_minutes(leg_m, truck.speed_kmph)
     # Arriving before the dock opens means waiting, not delivering early.
     delivery_min = max(arrival_at_buyer, buyer.window_start)
-    kg_rejected = sum(kg for crop, kg in load_by_crop.items() if not buyer.wants(crop))
+    kg_rejected = sum(f.quantity_kg for f in picked if not _buyer_takes(buyer, f))
 
     stops.append(
         Stop(
@@ -298,10 +346,12 @@ def _greedy_route(
         )
     )
 
-    # Flag the lots this buyer will not take, now that the buyer is known.
+    # Flag the lots this buyer will not take, now that the buyer is known --
+    # either the wrong crop, or below that farmer's minimum price.
+    takes = {f.id: _buyer_takes(buyer, f) for f in picked}
     for stop in stops:
         if stop.kind == StopKind.FARMER and stop.crop is not None:
-            stop.crop_accepted = buyer.wants(stop.crop)
+            stop.crop_accepted = takes.get(stop.ref_id, False)
 
     remaining_demand[buyer.id] = max(0, remaining_demand.get(buyer.id, 0) - load_kg)
 

@@ -50,6 +50,9 @@
     km_per_tonne:             ['Distance per tonne',             ''],
     cost_per_kg:              ['Transport cost per kg',          ''],
     trucks_used:              ['Trucks used',                    ''],
+    kg_sellable:              ['Sellable produce delivered',     'on time, to a buyer at the farmer\u2019s price'],
+    km_per_sellable_tonne:    ['Distance per sellable tonne',    'the like-for-like efficiency number'],
+    cost_per_sellable_kg:     ['Cost per sellable kg',           ''],
     farmer_payout_total:      ['Farmer net payout',              'after transport share'],
     farmer_gain_vs_middleman: ['Gain vs middleman',              'above the 0.65x base price']
   };
@@ -204,6 +207,13 @@
           headers: { 'content-type': 'application/json', accept: 'application/json' },
           body: JSON.stringify(body)
         };
+
+    // Every /api route needs a bearer token. The shell owns the session; the
+    // dashboard just reads the token it stored.
+    try {
+      var token = window.localStorage.getItem('kisanroute.token');
+      if (token) opts.headers.Authorization = 'Bearer ' + token;
+    } catch (_) { /* private browsing: let the request 401 and surface that */ }
 
     return fetch(path, opts).catch(function (e) {
       throw new Error('Cannot reach the KisanRoute API — is uvicorn still running? (' +
@@ -361,15 +371,18 @@
       (avg !== null && avg !== undefined ? ' · avg ' + fmtSigned(avg, 0, '%') + ' each' : '') +
       ' · net ' + fmtINR(o.farmer_payout_total, 0);
 
-    // Distance saved against the naive planner.
-    var saved = b.total_km - o.total_km;
+    // Distance per *sellable* tonne. Raw kilometres would compare a feasible
+    // plan with one that spoils produce and misses buyer windows; this compares
+    // what each plan spends to get a tonne to a paying buyer in good condition.
+    var perT = b.km_per_sellable_tonne - o.km_per_sellable_tonne;
+    var pct = b.km_per_sellable_tonne ? 100 * perT / b.km_per_sellable_tonne : 0;
     var kmTile = $('tile-km-value');
-    kmTile.innerHTML = fmtNum(saved, 1) + ' <small>km</small>';
-    kmTile.classList.toggle('is-bad', saved < 0);
-    var costSaved = b.total_cost - o.total_cost;
+    kmTile.innerHTML = fmtNum(Math.abs(pct), 1) + '<small>%</small>';
+    kmTile.classList.toggle('is-bad', perT < 0);
     $('tile-km-sub').textContent =
-      fmtNum(o.total_km, 1) + ' km vs ' + fmtNum(b.total_km, 1) + ' km · ' +
-      (costSaved >= 0 ? 'saves ' : 'costs ') + fmtINR(Math.abs(costSaved), 0) + ' of diesel';
+      (perT >= 0 ? 'less driving' : 'more driving') + ' per sellable tonne \u00b7 ' +
+      fmtNum(o.km_per_sellable_tonne, 1) + ' vs ' + fmtNum(b.km_per_sellable_tonne, 1) +
+      ' km/t \u00b7 ' + fmtKg(o.kg_sellable) + ' sellable vs ' + fmtKg(b.kg_sellable);
   }
 
   /* ------------------------------------------------------------------ */
@@ -1451,6 +1464,8 @@
   /* ------------------------------------------------------------------ */
   /* Boot                                                               */
   /* ------------------------------------------------------------------ */
+  var booted = false;
+
   function boot() {
     wire();
     // Debug handle: lets anyone poke at the live plan from the console during
@@ -1467,9 +1482,16 @@
     loadAll();
   }
 
-  if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', boot);
-  } else {
-    boot();
-  }
+  /* The dashboard no longer boots itself: shell.js decides, after login, that
+     this browser belongs to a coordinator and calls boot() once. */
+  window.kisanDashboard = {
+    boot: function () {
+      if (booted) return;
+      booted = true;
+      boot();
+    },
+    booted: function () { return booted; },
+    reload: loadAll,
+    state: state
+  };
 })();

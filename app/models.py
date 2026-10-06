@@ -82,6 +82,19 @@ class Farmer(BaseModel):
     harvest_time: int = Field(ge=0, description="Minutes from plan start when the lot was cut")
     ready_from: int = Field(ge=0, description="Earliest pickup, minutes from plan start")
     ready_until: int = Field(ge=0, description="Latest the farmer can hand the lot over")
+    phone: Optional[str] = Field(default=None, description="Shown to the driver coming for the lot")
+    #: The floor the farmer will sell at. A buyer offering less than this may
+    #: not be matched to the lot, however convenient the route would be.
+    min_price_per_kg: float = Field(default=0.0, ge=0)
+    #: Seeded lots are treated as already accepted so a live demo only needs
+    #: the one real farmer to tap Accept.
+    pre_accepted: bool = False
+    #: A farmer who declines their match withdraws the lot; it stays visible to
+    #: them (so they can re-post) but is kept out of every planning round.
+    withdrawn: bool = False
+    #: Username of the account that posted this lot. One account may own
+    #: several lots, so this is the link back to ``users``, not the lot id.
+    owner: Optional[str] = None
 
     @field_validator("quantity_kg", "harvest_time", "ready_from", "ready_until", mode="before")
     @classmethod
@@ -230,8 +243,24 @@ class Dataset(BaseModel):
     def buyers_for_crop(self, crop: str) -> List[Buyer]:
         return [b for b in self.buyers if b.wants(crop)]
 
+    def buyers_for_lot(self, farmer: Farmer) -> List[Buyer]:
+        """Buyers that want this crop **and** will pay the farmer's minimum."""
+        return [
+            b for b in self.buyers
+            if b.wants(farmer.crop) and b.price_for(farmer.crop) >= farmer.min_price_per_kg
+        ]
+
+    def best_offer_for_crop(self, crop: str) -> Optional[float]:
+        """The highest price anyone is offering for this crop today."""
+        offers = [b.price_for(crop) for b in self.buyers if b.wants(crop)]
+        return max(offers) if offers else None
+
+    def active_farmers(self) -> List[Farmer]:
+        """Lots still in play: everything a farmer has not withdrawn."""
+        return [f for f in self.farmers if not f.withdrawn]
+
     def total_supply_kg(self) -> int:
-        return sum(f.quantity_kg for f in self.farmers)
+        return sum(f.quantity_kg for f in self.active_farmers())
 
     def total_capacity_kg(self) -> int:
         return sum(t.capacity_kg for t in self.trucks)
@@ -318,6 +347,17 @@ class RouteResult(BaseModel):
     deadline_misses: int = 0
 
 
+class UnservedReason(str, Enum):
+    """Why a lot went unmatched. The UI branches on this, not on prose."""
+
+    PRICE = "price"            # buyers want the crop, none will pay the minimum
+    NO_BUYER = "no_buyer"      # nobody is buying this crop at all
+    WINDOW = "window"          # spoils before it can be collected
+    CAPACITY = "capacity"      # the fleet ran out of room
+    NO_TRUCK = "no_truck"      # no truck was available to plan with
+    OTHER = "other"
+
+
 class UnservedFarmer(BaseModel):
     """A farmer no truck picked up, with the reason stated plainly."""
 
@@ -327,6 +367,11 @@ class UnservedFarmer(BaseModel):
     crop: str
     quantity_kg: int
     reason: str
+    reason_code: UnservedReason = UnservedReason.OTHER
+    #: Set when ``reason_code`` is ``price``: the best price on offer today, so
+    #: the farmer can see exactly how far they are from a sale.
+    best_offer_per_kg: Optional[float] = None
+    min_price_per_kg: Optional[float] = None
 
 
 class PlanResult(BaseModel):
@@ -374,8 +419,13 @@ class PlanMetrics(BaseModel):
     deadlines_met_pct: float
     buyer_windows_met_pct: float
     kg_crop_mismatch: int
+    #: Delivered on time, to a buyer that wants the crop at the farmer's price.
+    #: The denominator the other efficiency numbers should really use.
+    kg_sellable: int
     km_per_tonne: float
+    km_per_sellable_tonne: float
     cost_per_kg: float
+    cost_per_sellable_kg: float
     farmer_payout_total: float
     farmer_gain_vs_middleman: float
 
@@ -564,3 +614,215 @@ class DatasetResponse(BaseModel):
     farmers: List[Farmer]
     buyers: List[Buyer]
     trucks: List[Truck]
+
+
+# --------------------------------------------------------------------------- #
+# Accounts, trips and the live shared workflow
+# --------------------------------------------------------------------------- #
+class Role(str, Enum):
+    FARMER = "farmer"
+    DRIVER = "driver"
+    BUYER = "buyer"
+    COORDINATOR = "coordinator"
+
+
+class TripStatus(str, Enum):
+    """Lifecycle of one truck's trip in a planning round.
+
+    ``proposed`` means the offer is out but at least one party has not answered.
+    ``confirmed`` means the driver **and** every farmer on the trip accepted;
+    only then is the trip locked and safe from the next re-plan.
+    """
+
+    IDLE = "idle"
+    PROPOSED = "proposed"
+    CONFIRMED = "confirmed"
+    DECLINED = "declined"
+    IN_TRANSIT = "in_transit"
+    DELIVERED = "delivered"
+
+
+#: Statuses a re-plan may not touch.
+LOCKED_TRIP_STATUSES = frozenset(
+    {TripStatus.CONFIRMED, TripStatus.IN_TRANSIT, TripStatus.DELIVERED}
+)
+
+
+class AcceptStatus(str, Enum):
+    PENDING = "pending"
+    ACCEPTED = "accepted"
+    DECLINED = "declined"
+
+
+class StopStatus(str, Enum):
+    PENDING = "pending"
+    PICKED_UP = "picked_up"
+
+
+class LotStatus(str, Enum):
+    """What a farmer sees next to their lot."""
+
+    WAITING = "waiting"          # posted, nothing matched to it yet
+    MATCHED = "matched"          # a buyer and truck are offered -- accept?
+    ACCEPTED = "accepted"        # this farmer said yes, trip not confirmed yet
+    CONFIRMED = "confirmed"      # driver and every farmer agreed
+    PICKED_UP = "picked_up"
+    DELIVERED = "delivered"
+    DECLINED = "declined"        # the farmer turned the match down
+    WITHDRAWN = "withdrawn"
+    UNMATCHED = "unmatched"      # see the lot's reason_code
+
+
+class Trip(BaseModel):
+    """One truck's trip and the three-sided agreement around it.
+
+    A trip only becomes binding when ``driver_accepted`` is true and every
+    entry in ``farmer_status`` is ``accepted``. Until then a re-plan may move
+    it, and if it does the acceptances are cleared and everyone is told.
+    """
+
+    truck_id: str
+    status: TripStatus = TripStatus.IDLE
+    #: The proposed (or, once confirmed, locked) route. ``None`` when idle or declined.
+    route: Optional[RouteResult] = None
+    driver_accepted: bool = False
+    driver_declined: bool = False
+    #: lot id -> whether that farmer has accepted this match.
+    farmer_status: Dict[str, AcceptStatus] = Field(default_factory=dict)
+    #: lot id -> whether the driver has collected it yet.
+    stop_status: Dict[str, StopStatus] = Field(default_factory=dict)
+    #: What the driver is paid: the route's transport cost.
+    fee: float = 0.0
+    #: Identifies the shape of the offer, so a re-plan can tell whether what
+    #: someone already agreed to has changed underneath them.
+    fingerprint: Optional[str] = None
+    proposed_at: Optional[str] = None
+    accepted_at: Optional[str] = None
+    declined_at: Optional[str] = None
+    confirmed_at: Optional[str] = None
+    delivered_at: Optional[str] = None
+
+    @property
+    def is_locked(self) -> bool:
+        return self.status in LOCKED_TRIP_STATUSES
+
+    def farmer_ids(self) -> List[str]:
+        return list(self.route.farmer_ids) if self.route else []
+
+    def awaiting_farmers(self) -> List[str]:
+        return [fid for fid, st in self.farmer_status.items() if st == AcceptStatus.PENDING]
+
+    def all_farmers_accepted(self) -> bool:
+        return bool(self.farmer_status) and all(
+            st == AcceptStatus.ACCEPTED for st in self.farmer_status.values()
+        )
+
+
+class Notification(BaseModel):
+    """One line in a user's bell menu."""
+
+    id: str
+    created_at: str
+    kind: str          # match_offer | trip_offer | confirmed | changed | price | info
+    title: str
+    body: str
+    read: bool = False
+
+
+class UserPublic(BaseModel):
+    """A user as the API hands it out: never includes the password hash."""
+
+    username: str
+    role: Role
+    #: F07 for a farmer account, T2 for a driver, B1 for a buyer, None for the coordinator.
+    ref_id: Optional[str] = None
+    display_name: str
+    village: Optional[str] = None
+    phone: Optional[str] = None
+    lat: Optional[float] = None
+    lng: Optional[float] = None
+
+
+class LoginRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    username: str = Field(min_length=1, max_length=64)
+    password: str = Field(min_length=1, max_length=256)
+
+
+class RegisterRequest(BaseModel):
+    """Farmer self-registration. The farm location is picked on a map."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    username: str = Field(min_length=3, max_length=64, pattern=r"^[A-Za-z0-9_.-]+$")
+    password: str = Field(min_length=6, max_length=256)
+    name: str = Field(min_length=1, max_length=120)
+    village: str = Field(min_length=1, max_length=120)
+    phone: str = Field(min_length=4, max_length=32)
+    lat: float = Field(ge=-90, le=90)
+    lng: float = Field(ge=-180, le=180)
+
+
+class AuthResponse(BaseModel):
+    token: str
+    user: UserPublic
+
+
+class LotCreate(BaseModel):
+    """POST /api/me/lots -- a farmer listing produce for pickup."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    crop: str
+    quantity_kg: int = Field(gt=0, le=100_000)
+    #: The farmer's floor. Leave it at 0 to accept any offer.
+    min_price_per_kg: float = Field(default=0.0, ge=0, le=10_000)
+    harvest_time: Optional[int] = Field(default=None, ge=0, le=1440)
+    ready_from: Optional[int] = Field(default=None, ge=0, le=1440)
+    ready_until: Optional[int] = Field(default=None, ge=0, le=1440)
+
+
+class LotPriceUpdate(BaseModel):
+    """POST /api/me/lots/{lot}/price -- the Edit price button."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    min_price_per_kg: float = Field(ge=0, le=10_000)
+
+
+class NotificationsRead(BaseModel):
+    """POST /api/me/notifications/read -- omit ids to clear the whole bell."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    ids: Optional[List[str]] = None
+
+
+class DemandUpdate(BaseModel):
+    """POST /api/me/demand -- a buyer posting what it wants today."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    crops_wanted: Optional[List[str]] = Field(default=None, min_length=1)
+    demand_kg: Optional[int] = Field(default=None, gt=0, le=1_000_000)
+    window_start: Optional[int] = Field(default=None, ge=0, le=1440)
+    window_end: Optional[int] = Field(default=None, ge=0, le=1440)
+    price_per_kg: Optional[Union[float, Dict[str, float]]] = None
+
+
+class StateEnvelope(BaseModel):
+    """What every view polls.
+
+    ``data`` is role-specific and assembled on the server, which is also where
+    the access rules live -- a farmer's envelope simply never contains another
+    farmer's payout.
+    """
+
+    version: int
+    changed: bool
+    planning: bool
+    role: Role
+    user: UserPublic
+    server_time: str
+    data: Dict[str, object] = Field(default_factory=dict)

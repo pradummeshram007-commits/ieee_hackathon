@@ -3,8 +3,8 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>KisanRoute — pickup routing for smallholder produce</title>
-<meta name="description" content="Groups nearby farmers into truck pickup routes that respect truck capacity, per-crop spoilage deadlines and buyer delivery windows.">
+<title>KisanRoute &mdash; pickup routing for smallholder produce</title>
+<meta name="description" content="Farmers list lots, the platform proposes truck trips, drivers accept them, and every account sees the same live plan.">
 
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%230d1a13'/%3E%3Cpath d='M7 23L14 12L20 18L25 9' stroke='%232fd47a' stroke-width='3.2' fill='none' stroke-linecap='round' stroke-linejoin='round'/%3E%3Ccircle cx='7' cy='23' r='3.2' fill='%23ffffff'/%3E%3C/svg%3E">
 
@@ -13,6 +13,7 @@
       integrity="sha384-sHL9NAb7lN7rfvG5lfHpm643Xkcjzp4jFvuavGOndn6pjVqS6ny56CAt3nsEVT4H"
       crossorigin="anonymous">
 <link rel="stylesheet" href="style.css">
+<link rel="stylesheet" href="views.css">
 </head>
 <body>
 
@@ -24,205 +25,470 @@
   <button class="banner__close" id="error-close" type="button" aria-label="Dismiss">&times;</button>
 </div>
 
-<!-- 1. HEADER BAR ------------------------------------------------------- -->
-<header class="topbar">
-  <div class="topbar__brand">
-    <h1>Kisan<span>Route</span></h1>
-    <p>Smallholder produce aggregation &mdash; truck capacity, crop spoilage deadlines and
-       buyer delivery windows, solved together.</p>
-  </div>
+<!-- ===================== LOGIN / REGISTER ========================= -->
+<section class="view auth" id="view-login">
+  <div class="auth__card">
+    <h1 class="auth__brand">Kisan<span>Route</span></h1>
+    <p class="auth__lede">
+      Farmers list produce, the planner proposes truck trips, drivers accept them.
+      Everyone sees the same plan, live.
+    </p>
 
-  <div class="tiles">
-    <div class="tile tile--hero" id="tile-spoiled">
-      <div class="tile__label">Produce spoiled</div>
-      <div class="tile__value" id="tile-spoiled-value">&mdash;</div>
-      <div class="tile__sub" id="tile-spoiled-sub">waiting for plan</div>
+    <div class="auth__tabs" id="auth-tabs" role="tablist">
+      <button type="button" data-auth-tab="login" class="is-active">Sign in</button>
+      <button type="button" data-auth-tab="register">Register as a farmer</button>
     </div>
-    <div class="tile tile--hero" id="tile-payout">
-      <div class="tile__label">Extra in farmers' hands</div>
-      <div class="tile__value" id="tile-payout-value">&mdash;</div>
-      <div class="tile__sub" id="tile-payout-sub">vs middleman prices</div>
+
+    <form class="auth__form" id="form-login" onsubmit="return false">
+      <label class="field">
+        <span>Username</span>
+        <input id="login-username" name="username" autocomplete="username"
+               autocapitalize="none" spellcheck="false" required>
+      </label>
+      <label class="field">
+        <span>Password</span>
+        <input id="login-password" name="password" type="password"
+               autocomplete="current-password" required>
+      </label>
+      <button class="btn btn--big" type="submit" id="btn-login">Sign in</button>
+    </form>
+
+    <div class="auth__demo" id="auth-demo">
+      <span class="auth__demo-label">One-click demo accounts</span>
+      <div class="chips" id="demo-chips"></div>
+      <p class="auth__hint">Every demo account uses the password <code>demo123</code>.</p>
+      <p class="auth__hint"><a href="#" id="link-register">Register as farmer &rarr;</a></p>
     </div>
-    <div class="tile tile--hero" id="tile-km">
-      <div class="tile__label">Distance saved</div>
-      <div class="tile__value" id="tile-km-value">&mdash;</div>
-      <div class="tile__sub" id="tile-km-sub">vs the naive planner</div>
+
+    <form class="auth__form" id="form-register" onsubmit="return false" hidden>
+      <div class="field-row">
+        <label class="field"><span>Your name</span>
+          <input id="reg-name" required maxlength="120"></label>
+        <label class="field"><span>Village</span>
+          <input id="reg-village" required maxlength="120"></label>
+      </div>
+      <div class="field-row">
+        <label class="field"><span>Phone</span>
+          <input id="reg-phone" required maxlength="32" inputmode="tel"></label>
+        <label class="field"><span>Username</span>
+          <input id="reg-username" required minlength="3" maxlength="64"
+                 autocapitalize="none" spellcheck="false"></label>
+      </div>
+      <label class="field"><span>Password (6 characters or more)</span>
+        <input id="reg-password" type="password" required minlength="6"
+               autocomplete="new-password"></label>
+
+      <div class="field">
+        <span>Farm location &mdash; click the map to drop a pin</span>
+        <div class="map map--pick" id="map-register"></div>
+        <p class="auth__coords" id="register-coords">No pin yet &mdash; click your field on the map.</p>
+      </div>
+      <button class="btn btn--big" type="submit" id="btn-register">Create account</button>
+    </form>
+
+    <p class="auth__error" id="auth-error" hidden role="alert"></p>
+  </div>
+</section>
+
+<!-- ===================== APP CHROME =============================== -->
+<header class="appbar" id="appbar" hidden>
+  <span class="appbar__brand">Kisan<span>Route</span></span>
+  <span class="appbar__role" id="appbar-role"></span>
+  <span class="appbar__user" id="appbar-user"></span>
+  <span class="appbar__planning" id="appbar-planning" hidden>
+    <span class="spinner" aria-hidden="true"></span>
+    <span id="appbar-planning-text">Re-optimising&hellip;</span>
+  </span>
+  <span class="appbar__spacer"></span>
+  <label class="appbar__lang" id="appbar-lang" hidden>
+    <span class="sr-only">Language</span>
+    <select id="lang-select" aria-label="Language">
+      <option value="en">English</option>
+      <option value="hi">&#2361;&#2367;&#2306;&#2342;&#2368;</option>
+      <option value="mr">&#2350;&#2352;&#2366;&#2336;&#2368;</option>
+    </select>
+  </label>
+  <div class="bell" id="bell">
+    <button class="bell__btn" id="bell-btn" type="button" aria-label="Notifications"
+            aria-haspopup="true" aria-expanded="false">
+      <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true">
+        <path fill="currentColor" d="M12 22a2.5 2.5 0 0 0 2.45-2h-4.9A2.5 2.5 0 0 0 12 22Zm7-6V11a7 7 0 0 0-5.5-6.84V3.5a1.5 1.5 0 0 0-3 0v.66A7 7 0 0 0 5 11v5l-2 2v1h18v-1l-2-2Z"/>
+      </svg>
+      <span class="bell__count" id="bell-count" hidden>0</span>
+    </button>
+    <div class="bell__menu" id="bell-menu" hidden>
+      <div class="bell__head">
+        <span>Notifications</span>
+        <button type="button" class="bell__clear" id="bell-clear">Mark all read</button>
+      </div>
+      <ol class="bell__list" id="bell-list"></ol>
     </div>
   </div>
+  <button class="btn btn--ghost" id="btn-logout" type="button">Logout</button>
 </header>
+<div class="toasts" id="toasts" aria-live="polite"></div>
 
-<!-- Solve progress ------------------------------------------------------ -->
-<div class="solving" id="solving">
-  <div class="solving__row">
-    <span class="solving__label" id="solving-label">Optimising routes&hellip;</span>
-    <span class="solving__clock" id="solving-clock">0.0s</span>
+<!-- ===================== FARMER =================================== -->
+<section class="view role" id="view-farmer" hidden>
+  <div class="role__wrap">
+    <article class="bigcard" id="farmer-card">
+      <div class="bigcard__top">
+        <span class="statuspill" id="farmer-status">&mdash;</span>
+        <span class="bigcard__lot" id="farmer-lot"></span>
+      </div>
+      <p class="bigcard__headline" id="farmer-headline"></p>
+      <dl class="bigcard__grid" id="farmer-grid"></dl>
+      <div class="bigcard__money" id="farmer-money"></div>
+      <p class="bigcard__reason" id="farmer-reason" hidden></p>
+      <div class="bigcard__actions" id="farmer-actions"></div>
+      <form class="priceedit" id="form-price" onsubmit="return false" hidden>
+        <label class="field">
+          <span data-i18n="new_min_price">New minimum price (&#8377;/kg)</span>
+          <input id="price-input" type="number" min="0" max="10000" step="0.5" required>
+        </label>
+        <button class="btn btn--big" type="submit" id="btn-save-price" data-i18n="save_price">Save price</button>
+      </form>
+    </article>
+
+    <section class="panel2">
+      <h2 data-i18n="your_pickup">Your pickup</h2>
+      <div class="map map--role" id="map-farmer"></div>
+      <p class="panel2__note" id="farmer-map-note"></p>
+    </section>
+
+    <section class="panel2" id="farmer-lots-panel">
+      <h2 data-i18n="your_lots">Your lots</h2>
+      <div class="lotlist" id="farmer-lots"></div>
+    </section>
+
+    <section class="panel2">
+      <h2 data-i18n="post_produce">Post new produce</h2>
+      <form class="roleform" id="form-lot" onsubmit="return false">
+        <label class="field"><span data-i18n="crop">Crop</span>
+          <select id="lot-crop" required></select></label>
+        <label class="field"><span data-i18n="quantity">Quantity (kg)</span>
+          <input id="lot-kg" type="number" min="1" max="100000" step="1" value="150" required></label>
+        <label class="field"><span data-i18n="min_price">Minimum price (&#8377;/kg)</span>
+          <input id="lot-price" type="number" min="0" max="10000" step="0.5" value="20" required>
+          <small class="field__hint" id="lot-price-hint"></small></label>
+        <label class="field"><span data-i18n="harvest_time">Harvested (minutes after 06:00)</span>
+          <input id="lot-harvest" type="number" min="0" max="1440" step="15" value="60" required>
+          <small class="field__hint" id="lot-harvest-hint"></small></label>
+        <label class="field"><span data-i18n="ready_from">Ready from (optional)</span>
+          <input id="lot-from" type="number" min="0" max="1440" step="15" placeholder="harvest + 30"></label>
+        <label class="field"><span data-i18n="ready_until">Ready until (optional)</span>
+          <input id="lot-until" type="number" min="0" max="1440" step="15" placeholder="ready + 360"></label>
+        <button class="btn btn--big" type="submit" id="btn-post-lot" data-i18n="post_it">Post produce</button>
+      </form>
+      <p class="roleform__msg" id="lot-msg" hidden></p>
+    </section>
   </div>
-  <div class="solving__track"><div class="solving__fill" id="solving-fill"></div></div>
-  <div class="solving__hint" id="solving-hint">
-    OR-Tools guided local search &mdash; 8 second budget
+</section>
+
+<!-- ===================== DRIVER =================================== -->
+<section class="view role" id="view-driver" hidden>
+  <div class="role__wrap">
+    <article class="trip" id="driver-trip">
+      <div class="trip__head">
+        <span class="statuspill" id="driver-status">&mdash;</span>
+        <h2 id="driver-title">Your trip</h2>
+      </div>
+      <div class="trip__stats" id="driver-stats"></div>
+      <p class="trip__waiting" id="driver-waiting" hidden></p>
+      <div class="trip__actions" id="driver-actions"></div>
+      <p class="trip__empty" id="driver-empty" hidden></p>
+    </article>
+
+    <section class="panel2">
+      <h2>Route</h2>
+      <div class="map map--role" id="map-driver"></div>
+    </section>
+
+    <section class="panel2">
+      <h2>Stops</h2>
+      <ol class="stoplist" id="driver-stops"></ol>
+    </section>
   </div>
-</div>
+</section>
 
-<main>
+<!-- ===================== BUYER ==================================== -->
+<section class="view role" id="view-buyer" hidden>
+  <div class="role__wrap">
+    <article class="trip">
+      <div class="trip__head">
+        <h2 id="buyer-title">Incoming produce</h2>
+      </div>
+      <div class="trip__stats" id="buyer-stats"></div>
+    </article>
 
-<!-- 2. MAP -------------------------------------------------------------- -->
-<section class="panel panel--map" id="panel-map">
-  <div class="panel__head">
-    <h2>Pickup routes</h2>
-    <div class="segmented" id="mode-toggle" role="group" aria-label="Which plan to show">
-      <button type="button" data-mode="optimized" class="is-active">Optimised</button>
-      <button type="button" data-mode="baseline">Naive baseline</button>
-      <button type="button" data-mode="both">Both side by side</button>
+    <section class="panel2">
+      <h2>Confirmed orders</h2>
+      <div class="incoming" id="buyer-confirmed"></div>
+    </section>
+
+    <section class="panel2">
+      <h2>Pending orders</h2>
+      <p class="panel2__note">Proposed by the planner; waiting for the driver and every farmer to accept.</p>
+      <div class="incoming" id="buyer-incoming"></div>
+    </section>
+
+    <section class="panel2">
+      <h2>On the road</h2>
+      <div class="map map--role" id="map-buyer"></div>
+    </section>
+
+    <section class="panel2">
+      <h2>Post demand</h2>
+      <form class="roleform" id="form-demand" onsubmit="return false">
+        <label class="field"><span>Crop</span>
+          <select id="demand-crop" required></select></label>
+        <label class="field"><span>Your offer (&#8377;/kg)</span>
+          <input id="demand-price" type="number" min="0.5" max="10000" step="0.1" required>
+          <small class="field__hint" id="demand-price-hint"></small></label>
+        <label class="field"><span>Total demand today (kg)</span>
+          <input id="demand-kg" type="number" min="1" max="1000000" step="50" required></label>
+        <div class="field">
+          <span>Currently buying</span>
+          <div class="pricelist" id="demand-current"></div>
+        </div>
+        <label class="field"><span>Window opens (minutes after 06:00)</span>
+          <input id="demand-start" type="number" min="0" max="1440" step="15" required></label>
+        <label class="field"><span>Window closes</span>
+          <input id="demand-end" type="number" min="0" max="1440" step="15" required></label>
+        <button class="btn btn--big" type="submit" id="btn-post-demand">Update demand</button>
+      </form>
+      <p class="roleform__msg" id="demand-msg" hidden></p>
+    </section>
+  </div>
+</section>
+
+<!-- ===================== COORDINATOR (existing dashboard) ========= -->
+<div id="view-coordinator" hidden>
+  <!-- 1. HEADER BAR ------------------------------------------------------- -->
+  <header class="topbar">
+    <div class="topbar__brand">
+      <h1>Kisan<span>Route</span></h1>
+      <p>Smallholder produce aggregation &mdash; truck capacity, crop spoilage deadlines and
+         buyer delivery windows, solved together.</p>
     </div>
-  </div>
 
-  <div class="maps" id="maps">
-    <figure class="mapwrap">
-      <figcaption class="mapwrap__cap" id="map-a-cap">Optimised</figcaption>
-      <div class="map" id="map-a"></div>
-      <div class="mapwrap__stats" id="map-a-stats"></div>
-    </figure>
-    <figure class="mapwrap" id="mapwrap-b" hidden>
-      <figcaption class="mapwrap__cap mapwrap__cap--bad">Naive baseline</figcaption>
-      <div class="map" id="map-b"></div>
-      <div class="mapwrap__stats" id="map-b-stats"></div>
-    </figure>
-  </div>
-
-  <div class="legend" id="legend"></div>
-</section>
-
-<!-- Disruption diff ----------------------------------------------------- -->
-<section class="panel panel--diff" id="diff-panel" hidden>
-  <div class="panel__head">
-    <h2 id="diff-title">Re-planned</h2>
-    <button class="btn btn--ghost" id="diff-close" type="button">Hide</button>
-  </div>
-  <p class="diff__desc" id="diff-desc"></p>
-  <div class="diff__deltas" id="diff-deltas"></div>
-  <div class="diff__lists" id="diff-lists"></div>
-</section>
-
-<!-- 3. COMPARISON ------------------------------------------------------- -->
-<section class="panel">
-  <div class="panel__head">
-    <h2>Optimiser vs naive baseline</h2>
-    <span class="panel__note" id="cmp-status"></span>
-  </div>
-
-  <div class="cmp">
-    <div class="cmp__table">
-      <div class="tablewrap">
-        <table class="dtable" id="metrics-table">
-          <thead>
-            <tr>
-              <th scope="col">Metric</th>
-              <th scope="col" class="num">Naive baseline</th>
-              <th scope="col" class="num">Optimised</th>
-              <th scope="col" class="num">Delta</th>
-              <th scope="col" class="num">Improvement</th>
-            </tr>
-          </thead>
-          <tbody id="metrics-body"></tbody>
-        </table>
+    <div class="tiles">
+      <div class="tile tile--hero" id="tile-spoiled">
+        <div class="tile__label">Produce spoiled</div>
+        <div class="tile__value" id="tile-spoiled-value">&mdash;</div>
+        <div class="tile__sub" id="tile-spoiled-sub">waiting for plan</div>
+      </div>
+      <div class="tile tile--hero" id="tile-payout">
+        <div class="tile__label">Extra in farmers' hands</div>
+        <div class="tile__value" id="tile-payout-value">&mdash;</div>
+        <div class="tile__sub" id="tile-payout-sub">vs middleman prices</div>
+      </div>
+      <div class="tile tile--hero" id="tile-km">
+        <div class="tile__label">Driving per sellable tonne</div>
+        <div class="tile__value" id="tile-km-value">&mdash;</div>
+        <div class="tile__sub" id="tile-km-sub">vs the naive planner</div>
       </div>
     </div>
-    <div class="cmp__chart">
-      <h3 class="chart__title">Headline metrics</h3>
-      <div class="chart__box"><canvas id="chart" aria-label="Grouped bar chart comparing the four headline metrics"></canvas></div>
-      <p class="chart__axis-note">
-        Bars are scaled per metric against the larger of the two values, so all four fit one axis.
-        Hover a bar for the real number.
-      </p>
-      <div class="chart__fallback" id="chart-fallback" hidden></div>
+  </header>
+
+  <!-- Solve progress ------------------------------------------------------ -->
+  <div class="solving" id="solving">
+    <div class="solving__row">
+      <span class="solving__label" id="solving-label">Optimising routes&hellip;</span>
+      <span class="solving__clock" id="solving-clock">0.0s</span>
+    </div>
+    <div class="solving__track"><div class="solving__fill" id="solving-fill"></div></div>
+    <div class="solving__hint" id="solving-hint">
+      OR-Tools guided local search &mdash; 8 second budget
     </div>
   </div>
 
-  <p class="footnote" id="served-footnote"></p>
-</section>
+  <main>
 
-<!-- 4. PAYOUTS ---------------------------------------------------------- -->
-<section class="panel">
-  <div class="panel__head">
-    <h2>Farmer payouts</h2>
-    <span class="panel__note" id="payout-note"></span>
+  <!-- Live trip board (added for the coordinator role) -------------------- -->
+  <section class="panel" id="panel-trips">
+    <div class="panel__head">
+      <h2>Live trip board</h2>
+      <span class="panel__note" id="trips-note"></span>
+    </div>
+    <div class="tripboard" id="trip-board"></div>
+    <h3 class="subhead">Unmatched lots <span id="unmatched-count"></span></h3>
+    <div class="tablewrap">
+      <table class="dtable" id="unmatched-table">
+        <thead>
+          <tr>
+            <th scope="col">Lot</th>
+            <th scope="col">Crop</th>
+            <th scope="col" class="num">kg</th>
+            <th scope="col">Why</th>
+            <th scope="col" class="num">Min / best offer</th>
+          </tr>
+        </thead>
+        <tbody id="unmatched-body"></tbody>
+      </table>
+    </div>
+  </section>
+
+
+  <!-- 2. MAP -------------------------------------------------------------- -->
+  <section class="panel panel--map" id="panel-map">
+    <div class="panel__head">
+      <h2>Pickup routes</h2>
+      <div class="segmented" id="mode-toggle" role="group" aria-label="Which plan to show">
+        <button type="button" data-mode="optimized" class="is-active">Optimised</button>
+        <button type="button" data-mode="baseline">Naive baseline</button>
+        <button type="button" data-mode="both">Both side by side</button>
+      </div>
+    </div>
+
+    <div class="maps" id="maps">
+      <figure class="mapwrap">
+        <figcaption class="mapwrap__cap" id="map-a-cap">Optimised</figcaption>
+        <div class="map" id="map-a"></div>
+        <div class="mapwrap__stats" id="map-a-stats"></div>
+      </figure>
+      <figure class="mapwrap" id="mapwrap-b" hidden>
+        <figcaption class="mapwrap__cap mapwrap__cap--bad">Naive baseline</figcaption>
+        <div class="map" id="map-b"></div>
+        <div class="mapwrap__stats" id="map-b-stats"></div>
+      </figure>
+    </div>
+
+    <div class="legend" id="legend"></div>
+  </section>
+
+  <!-- Disruption diff ----------------------------------------------------- -->
+  <section class="panel panel--diff" id="diff-panel" hidden>
+    <div class="panel__head">
+      <h2 id="diff-title">Re-planned</h2>
+      <button class="btn btn--ghost" id="diff-close" type="button">Hide</button>
+    </div>
+    <p class="diff__desc" id="diff-desc"></p>
+    <div class="diff__deltas" id="diff-deltas"></div>
+    <div class="diff__lists" id="diff-lists"></div>
+  </section>
+
+  <!-- 3. COMPARISON ------------------------------------------------------- -->
+  <section class="panel">
+    <div class="panel__head">
+      <h2>Optimiser vs naive baseline</h2>
+      <span class="panel__note" id="cmp-status"></span>
+    </div>
+
+    <div class="cmp">
+      <div class="cmp__table">
+        <div class="tablewrap">
+          <table class="dtable" id="metrics-table">
+            <thead>
+              <tr>
+                <th scope="col">Metric</th>
+                <th scope="col" class="num">Naive baseline</th>
+                <th scope="col" class="num">Optimised</th>
+                <th scope="col" class="num">Delta</th>
+                <th scope="col" class="num">Improvement</th>
+              </tr>
+            </thead>
+            <tbody id="metrics-body"></tbody>
+          </table>
+        </div>
+      </div>
+      <div class="cmp__chart">
+        <h3 class="chart__title">Headline metrics</h3>
+        <div class="chart__box"><canvas id="chart" aria-label="Grouped bar chart comparing the four headline metrics"></canvas></div>
+        <p class="chart__axis-note">
+          Bars are scaled per metric against the larger of the two values, so all four fit one axis.
+          Hover a bar for the real number.
+        </p>
+        <div class="chart__fallback" id="chart-fallback" hidden></div>
+      </div>
+    </div>
+
+    <p class="footnote" id="served-footnote"></p>
+  </section>
+
+  <!-- 4. PAYOUTS ---------------------------------------------------------- -->
+  <section class="panel">
+    <div class="panel__head">
+      <h2>Farmer payouts</h2>
+      <span class="panel__note" id="payout-note"></span>
+    </div>
+    <p class="panel__lede">
+      Revenue is kg &times; the buyer's price for that crop, minus the farmer's pro-rata share of
+      their truck's transport cost. The middleman column is what the same lot fetches today at
+      0.65&times; the base price. Click a column heading to sort.
+    </p>
+    <div class="tablewrap">
+      <table class="dtable dtable--sortable" id="payout-table">
+        <thead>
+          <tr id="payout-head">
+            <th scope="col" data-key="farmer_id" data-type="text">Farmer</th>
+            <th scope="col" data-key="crop" data-type="text">Crop</th>
+            <th scope="col" data-key="kg" data-type="num" class="num">kg</th>
+            <th scope="col" data-key="truck_id" data-type="text">Truck</th>
+            <th scope="col" data-key="gross_revenue" data-type="num" class="num">Gross</th>
+            <th scope="col" data-key="transport_share" data-type="num" class="num">Transport</th>
+            <th scope="col" data-key="net_payout" data-type="num" class="num">Net</th>
+            <th scope="col" data-key="middleman_revenue" data-type="num" class="num">Middleman</th>
+            <th scope="col" data-key="gain_vs_middleman" data-type="num" class="num">Gain</th>
+            <th scope="col" data-key="gain_pct" data-type="num" class="num">Gain %</th>
+          </tr>
+        </thead>
+        <tbody id="payout-body"></tbody>
+        <tfoot id="payout-foot"></tfoot>
+      </table>
+    </div>
+
+    <h3 class="subhead">Unserved lots <span id="unserved-count"></span></h3>
+    <div class="tablewrap">
+      <table class="dtable" id="unserved-table">
+        <thead>
+          <tr>
+            <th scope="col">Farmer</th>
+            <th scope="col">Village</th>
+            <th scope="col">Crop</th>
+            <th scope="col" class="num">kg</th>
+            <th scope="col">Why no truck came</th>
+          </tr>
+        </thead>
+        <tbody id="unserved-body"></tbody>
+      </table>
+    </div>
+  </section>
+
+  <footer class="pagefoot">
+    <span id="foot-status">KisanRoute</span>
+  </footer>
+  </main>
+
+  <!-- 5. DISRUPTION CONTROLS (sticky) ------------------------------------- -->
+  <div class="actionbar" id="actionbar">
+    <div class="actionbar__title">Disrupt &amp; re-plan</div>
+
+    <div class="ctl">
+      <select id="sel-truck" aria-label="Truck to break down"></select>
+      <button class="btn btn--warn" id="btn-truck" type="button">Truck breakdown</button>
+    </div>
+
+    <div class="ctl">
+      <select id="sel-buyer" aria-label="Buyer that cancels"></select>
+      <button class="btn btn--warn" id="btn-buyer" type="button">Buyer cancels</button>
+    </div>
+
+    <div class="ctl">
+      <select id="sel-farmer" aria-label="Farmer whose pickup is delayed"></select>
+      <input id="inp-delay" type="number" min="15" max="600" step="15" value="150"
+             aria-label="Delay in minutes">
+      <span class="ctl__unit">min</span>
+      <button class="btn btn--warn" id="btn-delay" type="button">Pickup delayed</button>
+    </div>
+
+    <div class="actionbar__spacer"></div>
+    <span class="actionbar__busy" id="actionbar-busy" hidden>
+      <span class="spinner" aria-hidden="true"></span>
+      <span id="actionbar-busy-text">Re-planning&hellip;</span>
+    </span>
+    <button class="btn btn--ghost" id="btn-reset" type="button">Reset dataset</button>
   </div>
-  <p class="panel__lede">
-    Revenue is kg &times; the buyer's price for that crop, minus the farmer's pro-rata share of
-    their truck's transport cost. The middleman column is what the same lot fetches today at
-    0.65&times; the base price. Click a column heading to sort.
-  </p>
-  <div class="tablewrap">
-    <table class="dtable dtable--sortable" id="payout-table">
-      <thead>
-        <tr id="payout-head">
-          <th scope="col" data-key="farmer_id" data-type="text">Farmer</th>
-          <th scope="col" data-key="crop" data-type="text">Crop</th>
-          <th scope="col" data-key="kg" data-type="num" class="num">kg</th>
-          <th scope="col" data-key="truck_id" data-type="text">Truck</th>
-          <th scope="col" data-key="gross_revenue" data-type="num" class="num">Gross</th>
-          <th scope="col" data-key="transport_share" data-type="num" class="num">Transport</th>
-          <th scope="col" data-key="net_payout" data-type="num" class="num">Net</th>
-          <th scope="col" data-key="middleman_revenue" data-type="num" class="num">Middleman</th>
-          <th scope="col" data-key="gain_vs_middleman" data-type="num" class="num">Gain</th>
-          <th scope="col" data-key="gain_pct" data-type="num" class="num">Gain %</th>
-        </tr>
-      </thead>
-      <tbody id="payout-body"></tbody>
-      <tfoot id="payout-foot"></tfoot>
-    </table>
-  </div>
-
-  <h3 class="subhead">Unserved lots <span id="unserved-count"></span></h3>
-  <div class="tablewrap">
-    <table class="dtable" id="unserved-table">
-      <thead>
-        <tr>
-          <th scope="col">Farmer</th>
-          <th scope="col">Village</th>
-          <th scope="col">Crop</th>
-          <th scope="col" class="num">kg</th>
-          <th scope="col">Why no truck came</th>
-        </tr>
-      </thead>
-      <tbody id="unserved-body"></tbody>
-    </table>
-  </div>
-</section>
-
-<footer class="pagefoot">
-  <span id="foot-status">KisanRoute</span>
-</footer>
-</main>
-
-<!-- 5. DISRUPTION CONTROLS (sticky) ------------------------------------- -->
-<div class="actionbar" id="actionbar">
-  <div class="actionbar__title">Disrupt &amp; re-plan</div>
-
-  <div class="ctl">
-    <select id="sel-truck" aria-label="Truck to break down"></select>
-    <button class="btn btn--warn" id="btn-truck" type="button">Truck breakdown</button>
-  </div>
-
-  <div class="ctl">
-    <select id="sel-buyer" aria-label="Buyer that cancels"></select>
-    <button class="btn btn--warn" id="btn-buyer" type="button">Buyer cancels</button>
-  </div>
-
-  <div class="ctl">
-    <select id="sel-farmer" aria-label="Farmer whose pickup is delayed"></select>
-    <input id="inp-delay" type="number" min="15" max="600" step="15" value="150"
-           aria-label="Delay in minutes">
-    <span class="ctl__unit">min</span>
-    <button class="btn btn--warn" id="btn-delay" type="button">Pickup delayed</button>
-  </div>
-
-  <div class="actionbar__spacer"></div>
-  <span class="actionbar__busy" id="actionbar-busy" hidden>
-    <span class="spinner" aria-hidden="true"></span>
-    <span id="actionbar-busy-text">Re-planning&hellip;</span>
-  </span>
-  <button class="btn btn--ghost" id="btn-reset" type="button">Reset dataset</button>
 </div>
 
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
@@ -234,5 +500,6 @@
         crossorigin="anonymous"
         onerror="window.__kisanCdn=(window.__kisanCdn||[]).concat('Chart.js')"></script>
 <script src="app.js"></script>
+<script src="shell.js"></script>
 </body>
 </html>

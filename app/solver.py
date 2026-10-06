@@ -66,6 +66,7 @@ from .models import (
     StopKind,
     Truck,
     UnservedFarmer,
+    UnservedReason,
     minutes_to_clock,
 )
 
@@ -131,7 +132,12 @@ def _empty_plan(
     )
 
 
-def _unserved(dataset: Dataset, farmer: Farmer, reason: str) -> UnservedFarmer:
+def _unserved(
+    dataset: Dataset,
+    farmer: Farmer,
+    reason: str,
+    code: UnservedReason = UnservedReason.OTHER,
+) -> UnservedFarmer:
     return UnservedFarmer(
         farmer_id=farmer.id,
         name=farmer.name,
@@ -139,7 +145,38 @@ def _unserved(dataset: Dataset, farmer: Farmer, reason: str) -> UnservedFarmer:
         crop=farmer.crop,
         quantity_kg=farmer.quantity_kg,
         reason=reason,
+        reason_code=code,
+        best_offer_per_kg=(
+            dataset.best_offer_for_crop(farmer.crop) if code == UnservedReason.PRICE else None
+        ),
+        min_price_per_kg=(
+            farmer.min_price_per_kg if code == UnservedReason.PRICE else None
+        ),
     )
+
+
+def price_block_message(dataset: Dataset, farmer: Farmer) -> str:
+    """The sentence a farmer sees when nobody will pay their minimum."""
+    crop = farmer.crop.replace("_", " ")
+    best = dataset.best_offer_for_crop(farmer.crop)
+    offer = f"\u20b9{best:.2f}/kg" if best is not None else "no offer at all"
+    return (
+        f"No buyer at your price. Best offer for {crop} today: {offer}. "
+        f"Your {crop} spoils at {spoils_phrase(dataset.spoilage_deadline(farmer))}."
+    )
+
+
+def spoils_phrase(deadline_min: int) -> str:
+    """'11:35' today, or '08:50, 3 days from now' for long-life crops.
+
+    The dashboard's '08:50+3d' is fine for a coordinator but reads like a typo
+    in a sentence addressed to a farmer.
+    """
+    clock = minutes_to_clock(deadline_min).split("+")[0]
+    days = (6 * 60 + deadline_min) // 1440
+    if days <= 0:
+        return clock
+    return f"{clock}, {days} day{'s' if days > 1 else ''} from now"
 
 
 def _prefilter(dataset: Dataset) -> Tuple[List[Farmer], List[UnservedFarmer]]:
@@ -159,7 +196,7 @@ def _prefilter(dataset: Dataset) -> Tuple[List[Farmer], List[UnservedFarmer]]:
     modelled: List[Farmer] = []
     rejected: List[UnservedFarmer] = []
 
-    for farmer in dataset.farmers:
+    for farmer in dataset.active_farmers():
         if farmer.crop not in dataset.crops:
             rejected.append(
                 _unserved(dataset, farmer, f"crop '{farmer.crop}' is not in the catalogue")
@@ -167,7 +204,24 @@ def _prefilter(dataset: Dataset) -> Tuple[List[Farmer], List[UnservedFarmer]]:
             continue
         if not dataset.buyers_for_crop(farmer.crop):
             rejected.append(
-                _unserved(dataset, farmer, f"no buyer is accepting {farmer.crop} today")
+                _unserved(
+                    dataset, farmer,
+                    f"no buyer is accepting {farmer.crop} today",
+                    UnservedReason.NO_BUYER,
+                )
+            )
+            continue
+        if not dataset.buyers_for_lot(farmer):
+            # Buyers want the crop, but none of them will meet this farmer's
+            # floor. That is a price problem, not a routing one, and it gets
+            # its own reason so the farmer is offered an Edit price button
+            # rather than an apology about truck capacity.
+            rejected.append(
+                _unserved(
+                    dataset, farmer,
+                    price_block_message(dataset, farmer),
+                    UnservedReason.PRICE,
+                )
             )
             continue
         lower, upper = dataset.pickup_window(farmer)
@@ -179,13 +233,16 @@ def _prefilter(dataset: Dataset) -> Tuple[List[Farmer], List[UnservedFarmer]]:
                     farmer,
                     f"lot spoils at minute {deadline} ({minutes_to_clock(deadline)}) but is "
                     f"not ready for pickup until minute {lower} ({minutes_to_clock(lower)})",
+                    UnservedReason.WINDOW,
                 )
             )
             continue
         if lower > HORIZON_MIN:
             rejected.append(
                 _unserved(
-                    dataset, farmer, f"pickup window opens past the {HORIZON_MIN} min horizon"
+                    dataset, farmer,
+                    f"pickup window opens past the {HORIZON_MIN} min horizon",
+                    UnservedReason.WINDOW,
                 )
             )
             continue
@@ -232,20 +289,26 @@ def solve(
     """Build and solve the pickup-routing model. Always returns a plan."""
     started = _time.perf_counter()
 
-    if not dataset.farmers:
+    if not dataset.active_farmers():
         return _empty_plan("NO_FARMERS", "No farmers have produce listed.", [], _time.perf_counter() - started)
     if not dataset.trucks:
         return _empty_plan(
             "NO_TRUCKS",
             "No trucks available: every lot stays on the farm.",
-            [_unserved(dataset, f, "no truck in the fleet") for f in dataset.farmers],
+            [
+                _unserved(dataset, f, "no truck in the fleet", UnservedReason.NO_TRUCK)
+                for f in dataset.active_farmers()
+            ],
             _time.perf_counter() - started,
         )
     if not dataset.buyers:
         return _empty_plan(
             "NO_BUYERS",
             "No buyer is accepting deliveries: nothing can be routed.",
-            [_unserved(dataset, f, "no buyer is accepting deliveries") for f in dataset.farmers],
+            [
+                _unserved(dataset, f, "no buyer is accepting deliveries", UnservedReason.NO_BUYER)
+                for f in dataset.active_farmers()
+            ],
             _time.perf_counter() - started,
         )
 
@@ -382,7 +445,10 @@ def solve(
         routing.AddVariableMinimizedByFinalizer(time_dim.CumulVar(routing.Start(vehicle.index)))
         routing.AddVariableMinimizedByFinalizer(time_dim.CumulVar(end_index))
 
-    # Crop compatibility: a lot may only ride a truck whose buyer wants it.
+    # Matching rule: a lot may only ride a truck whose buyer wants that crop
+    # AND offers at least the farmer's minimum price. Both halves go through
+    # the same VehicleVar domain restriction, so an unaffordable match is not
+    # merely discouraged by the objective -- it is not in the search space.
     # (RoutingModel.SetAllowedVehiclesForIndex is not callable from Python in
     # OR-Tools 9.x -- its absl::Span typemap is unwired -- so we restrict the
     # VehicleVar domain directly. -1 must stay in the domain or the node could
@@ -393,6 +459,8 @@ def solve(
             vehicle.index
             for vehicle in vehicles
             if dataset.buyers[vehicle.buyer_index].wants(farmer.crop)
+            and dataset.buyers[vehicle.buyer_index].price_for(farmer.crop)
+            >= farmer.min_price_per_kg
         ]
         routing.VehicleVar(index).SetValues([-1] + allowed)
 
@@ -476,13 +544,8 @@ def solve(
     earliest_arrival = _earliest_arrival_minutes(dataset, modelled, farmer_node, distance_m, depot_node_by_coord)
     for position, farmer in enumerate(modelled):
         if farmer_node[position] not in served_nodes:
-            unserved.append(
-                _unserved(
-                    dataset,
-                    farmer,
-                    _drop_reason(dataset, farmer, earliest_arrival[farmer.id], shortfall),
-                )
-            )
+            text, code = _drop_reason(dataset, farmer, earliest_arrival[farmer.id], shortfall)
+            unserved.append(_unserved(dataset, farmer, text, code))
 
     total_distance_m = sum(r.distance_m for r in routes)
     plan = PlanResult(
@@ -535,8 +598,10 @@ def _earliest_arrival_minutes(
     return earliest
 
 
-def _drop_reason(dataset: Dataset, farmer: Farmer, earliest_arrival: int, shortfall_kg: int) -> str:
-    """Plain-language explanation for a farmer the optimiser left behind."""
+def _drop_reason(
+    dataset: Dataset, farmer: Farmer, earliest_arrival: int, shortfall_kg: int
+) -> Tuple[str, UnservedReason]:
+    """Plain-language explanation, plus a code the UI can branch on."""
     lower, upper = dataset.pickup_window(farmer)
     deadline = dataset.spoilage_deadline(farmer)
 
@@ -544,7 +609,8 @@ def _drop_reason(dataset: Dataset, farmer: Farmer, earliest_arrival: int, shortf
         return (
             f"unreachable in time: the closest depot is {earliest_arrival} min away but the "
             f"pickup window shuts at minute {upper} ({minutes_to_clock(upper)}); "
-            f"{farmer.crop} spoils at minute {deadline}"
+            f"{farmer.crop} spoils at minute {deadline}",
+            UnservedReason.WINDOW,
         )
     if upper == deadline and upper < farmer.ready_until:
         window = (
@@ -559,9 +625,13 @@ def _drop_reason(dataset: Dataset, farmer: Farmer, earliest_arrival: int, shortf
     if shortfall_kg > 0:
         return (
             f"left behind: the fleet is {shortfall_kg} kg short of listed supply, so taking this "
-            f"lot would mean giving up a larger one ({window})"
+            f"lot would mean giving up a larger one ({window})",
+            UnservedReason.CAPACITY,
         )
-    return f"no feasible insertion: no truck could fit the detour within capacity ({window})"
+    return (
+        f"no feasible insertion: no truck could fit the detour within capacity ({window})",
+        UnservedReason.CAPACITY,
+    )
 
 
 def _extract_routes(

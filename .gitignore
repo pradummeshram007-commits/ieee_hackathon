@@ -12,3 +12,8 @@ env/
 .vscode/
 .idea/
 .DS_Store
+
+# Local database
+*.db
+*.db-journal
+*.sqlite3

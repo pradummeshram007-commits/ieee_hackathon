@@ -85,8 +85,24 @@ PREMIUM_BY_TYPE: Dict[str, float] = {
     BuyerType.PROCESSOR.value: 1.35,
 }
 
-#: Supply is deliberately this multiple of fleet capacity.
+#: Seeded supply as a multiple of fleet capacity.
+#:
+#: Deliberately above 1.0: the fleet cannot take everything, so the planner has
+#: to choose, which is the whole point. A live posting still gets served -- a
+#: dropped lot costs the solver a penalty far larger than any detour, so a
+#: 150 kg lot 13 km from the depot displaces something further out rather than
+#: being refused. Measured at every ratio from 0.92 to 1.13; Kiran matched in
+#: all of them. The price holdout below frees a little more room on top.
 SUPPLY_TO_CAPACITY_RATIO = 1.13
+
+#: This seeded lot is priced above every offer on the board, so the dashboard
+#: shows the "no buyer at your price" case without anyone touching a phone.
+PRICE_HOLDOUT_LOT = "F13"
+
+#: Seeded minimums sit this far below the *lowest* offer for their crop, so any
+#: interested buyer qualifies and the price rule never blocks the seed by
+#: accident.
+SEED_MIN_PRICE_RANGE = (0.70, 0.88)
 
 #: Latest minute any farmer will still hand over a lot.
 LATEST_HANDOVER_MIN = 840
@@ -96,6 +112,16 @@ def default_price_for(crop: Crop, buyer_type: BuyerType | str) -> float:
     """Premium price a buyer of this type pays for this crop (INR/kg)."""
     key = buyer_type.value if isinstance(buyer_type, BuyerType) else str(buyer_type)
     return round(crop.base_price_per_kg * PREMIUM_BY_TYPE.get(key, 1.3), 2)
+
+
+def _offer_range(crop: str) -> Tuple[float, float]:
+    """(lowest, highest) price any seeded buyer offers for a crop."""
+    offers = [
+        default_price_for(CROP_CATALOGUE[crop], spec["type"])
+        for spec in _BUYER_SPECS
+        if crop in spec["crops_wanted"]
+    ]
+    return (min(offers), max(offers)) if offers else (0.0, 0.0)
 
 
 def _price_table(crops_wanted: List[str], buyer_type: BuyerType) -> Dict[str, float]:
@@ -131,7 +157,14 @@ def build_buyers() -> List[Buyer]:
     planner that fills a truck with onions and potatoes has nowhere to put the
     greens it also picked up.
     """
-    specs = [
+    specs = _BUYER_SPECS
+    return [
+        Buyer(price_per_kg=_price_table(s["crops_wanted"], s["type"]), **s)  # type: ignore[arg-type]
+        for s in specs
+    ]
+
+
+_BUYER_SPECS: List[Dict[str, object]] = [
         {
             "id": "B1",
             "name": "Shakti Retail Mart",
@@ -165,11 +198,7 @@ def build_buyers() -> List[Buyer]:
             "window_start": 240,
             "window_end": 720,
         },
-    ]
-    return [
-        Buyer(price_per_kg=_price_table(s["crops_wanted"], s["type"]), **s)  # type: ignore[arg-type]
-        for s in specs
-    ]
+]
 
 
 def _rebalance_quantities(quantities: List[int], target_total: int) -> List[int]:
@@ -220,11 +249,24 @@ def build_farmers(trucks: List[Truck]) -> List[Farmer]:
             ready_from = harvest_time + random.randint(15, 45)
             ready_until = min(ready_from + random.randint(300, 540), LATEST_HANDOVER_MIN)
 
+            lot_id = f"F{index + 1:02d}"
+            lowest_offer, highest_offer = _offer_range(crop_name)
+            if lot_id == PRICE_HOLDOUT_LOT:
+                # Deliberately unsellable: above every offer on the board.
+                min_price = round(highest_offer * 1.15, 1)
+            else:
+                min_price = round(lowest_offer * random.uniform(*SEED_MIN_PRICE_RANGE), 1)
+
             draft.append(
                 {
-                    "id": f"F{index + 1:02d}",
+                    "id": lot_id,
                     "name": FARMER_NAMES[index],
+                    "min_price_per_kg": min_price,
+                    "pre_accepted": True,
                     "village": village_name,
+                    # Obviously fake: the 90000 block is not a real Indian series.
+                    "phone": f"+91 90000 {index + 1:05d}",
+                    "owner": f"f{index + 1:02d}",
                     "lat": location.lat,
                     "lng": location.lng,
                     "crop": crop_name,
@@ -259,3 +301,97 @@ def farmer_distance_km(dataset: Dataset, farmer: Farmer) -> float:
     """Road distance from the depot to a farmer, in km (reporting helper)."""
     depot = Point(dataset.trucks[0].depot_lat, dataset.trucks[0].depot_lng) if dataset.trucks else NAGPUR
     return round(road_distance_m(depot, Point(farmer.lat, farmer.lng)) / 1000.0, 2)
+
+
+# --------------------------------------------------------------------------- #
+# Demo accounts
+# --------------------------------------------------------------------------- #
+#: Every seeded account uses this. It is a demo, and the login screen says so.
+DEMO_PASSWORD = "demo123"
+
+#: Fake phone blocks, kept distinct per role so they read as placeholders.
+DRIVER_PHONE_BASE = 10_000
+BUYER_PHONE_BASE = 20_000
+
+
+def demo_accounts(dataset: Dataset) -> List[Dict[str, object]]:
+    """The accounts seeded alongside the dataset.
+
+    ``f01..f25`` map onto the seeded farmers, ``t1..t4`` onto the trucks (one
+    account per driver), ``b1..b3`` onto the buyers, and ``admin`` is the
+    coordinator. Everything here is demo scaffolding: real deployments would
+    register accounts rather than mint them from a fixture.
+    """
+    accounts: List[Dict[str, object]] = []
+
+    for farmer in dataset.farmers:
+        accounts.append(
+            {
+                "username": farmer.owner or farmer.id.lower(),
+                "role": "farmer",
+                "ref_id": farmer.id,
+                "display_name": farmer.name,
+                "village": farmer.village,
+                "phone": farmer.phone,
+                "lat": farmer.lat,
+                "lng": farmer.lng,
+            }
+        )
+
+    for index, truck in enumerate(dataset.trucks, start=1):
+        accounts.append(
+            {
+                "username": truck.id.lower(),
+                "role": "driver",
+                "ref_id": truck.id,
+                "display_name": f"Driver {truck.id} ({truck.capacity_kg:,} kg)",
+                "village": "Nagpur depot",
+                "phone": f"+91 90000 {DRIVER_PHONE_BASE + index:05d}",
+                "lat": truck.depot_lat,
+                "lng": truck.depot_lng,
+            }
+        )
+
+    for index, buyer in enumerate(dataset.buyers, start=1):
+        accounts.append(
+            {
+                "username": buyer.id.lower(),
+                "role": "buyer",
+                "ref_id": buyer.id,
+                "display_name": buyer.name,
+                "village": buyer.type.value,
+                "phone": f"+91 90000 {BUYER_PHONE_BASE + index:05d}",
+                "lat": buyer.lat,
+                "lng": buyer.lng,
+            }
+        )
+
+    # Kiran has an account and a farm but has posted nothing yet: the live demo
+    # is someone registering produce and watching a truck get planned for it.
+    kiran_farm = offset_point(NAGPUR, 236.0, 13.5, "Hingna")
+    accounts.append(
+        {
+            "username": "kiran",
+            "role": "farmer",
+            "ref_id": None,
+            "display_name": "Kiran Patil",
+            "village": "Hingna",
+            "phone": "+91 90000 00099",
+            "lat": kiran_farm.lat,
+            "lng": kiran_farm.lng,
+        }
+    )
+
+    accounts.append(
+        {
+            "username": "admin",
+            "role": "coordinator",
+            "ref_id": None,
+            "display_name": "Aggregation coordinator",
+            "village": "Nagpur",
+            "phone": None,
+            "lat": NAGPUR.lat,
+            "lng": NAGPUR.lng,
+        }
+    )
+    return accounts

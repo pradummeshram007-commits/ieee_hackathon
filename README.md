@@ -1,14 +1,17 @@
 # KisanRoute
 
-Smallholder produce aggregation and pickup routing.
+A live three-sided marketplace for smallholder produce.
 
-Farmers list perishable lots. Buyers post demand. A planner groups nearby
-farmers into truck pickup routes that respect **truck capacity**, **per-crop
-spoilage deadlines** and **buyer delivery windows** at the same time — and
-hands each farmer a payout that beats the middleman price.
+Farmers post lots with a **minimum price**. Buyers post demand with an **offer
+price**. The optimiser matches lots to buyers who want that crop *and* pay at
+least the farmer's minimum, and plans truck routes that respect **truck
+capacity**, **per-crop spoilage deadlines** and **buyer delivery windows** at
+the same time. The farmer, the driver and the buyer each accept on their own
+screen. A trip is confirmed only when the driver and every farmer on it have
+said yes, and every screen hears about it within one 3-second poll.
 
-One FastAPI service, one Render web service, no database, no maps API, no
-network calls at runtime.
+One FastAPI service, one Render web service, SQLite (or PostgreSQL), no maps
+API, no network calls at runtime.
 
 ---
 
@@ -29,41 +32,59 @@ asserted:
 | Spoilage deadline | **hard constraint** | **ignored** |
 | Buyer time window | **hard constraint** | ignored (waits if early, late if late) |
 | Crop/buyer match | hard constraint | one buyer per truck, chosen after loading |
+| Farmer's minimum price | **hard constraint** (in the search space) | applied: never collects an unsellable lot |
 
-On the seeded dataset (25 farmers, 4 trucks, 8-second solve):
+On the seeded dataset (25 farmers, 4 trucks, 8-second solve), baseline → optimised:
 
 ```
-total_km                  808.35  ->  702.55   (+13.1% better)
-total_cost (INR)       15,140.54  -> 12,611.62 (+16.7% better)
-kg_spoiled                   478  ->        0  (+100%)
-deadlines met                91%  ->     100%
-buyer windows met            50%  ->     100%
-kg to the wrong buyer      1,105  ->        0
-farmer net payout (INR)   95,990  ->  121,989  (+27.1%)
+sellable produce delivered     4,191 kg  ->   4,967 kg   (+18.5%)
+distance per sellable tonne    152.7 km  ->   132.1 km   (+13.5% better)
+cost per sellable kg           ₹2.98     ->   ₹2.35      (+21.1% better)
+kg_spoiled                       149     ->       0
+buyer windows met                75%     ->     100%
+kg to the wrong buyer / below price  772 ->       0
+farmer net payout             ₹90,467    ->  ₹1,07,211   (+18.5%)
+raw distance                   640.0 km  ->   656.2 km   (−2.5%)
 ```
 
-The optimiser serves 21 farmers to the baseline's 22 but moves *more* kilos
-(5,028 vs 4,954): it drops small lots rather than large ones, and never drops
-one it could have collected in time. Supply is deliberately 113% of fleet
-capacity, so something always has to be left behind — and every unserved lot
-comes back with a stated reason.
+**Why the efficiency number is per *sellable* tonne.** The greedy plan is
+infeasible: it collects produce after it has spoiled, misses buyer windows and
+dumps lots on buyers who will not take them. Its raw distance therefore buys
+less. Before the price rule existed, the optimiser also won on raw kilometres.
+That was because the baseline wasted trips on produce nobody could sell. Once
+the same price rule stops the baseline doing that, the two drive similar
+distances (within 2.5% here), and what separates them is how much of the
+cargo actually reaches a paying buyer in good condition. Measured across six
+seeds, raw distance swings either way; distance per sellable tonne favours the
+optimiser on the default seed and on four of the five others. `smoke_test.py`
+asserts the per-sellable-tonne win, and keeps raw distance within 15% of the
+baseline rather than asserting a raw-distance win the data no longer supports.
+
+Supply is deliberately 113% of fleet capacity, so something is always left
+behind, and every unmatched lot comes back with a reason **code**: `price`,
+`capacity`, `window` or `no_buyer`.
 
 ---
 
 ## Architecture
 
 ```
-HTTP  ──►  app/main.py          FastAPI: dataset CRUD, /plan, /disrupt, /reset
-                │               in-memory AppState + one process-wide lock
-                ├──►  app/seed.py       deterministic dataset (random.seed(42))
-                ├──►  app/solver.py     OR-Tools CP routing model   ─┐
-                ├──►  app/baseline.py   naive greedy planner        ─┤ same
-                │                                                    │ PlanResult
-                └──►  app/metrics.py    metrics, deltas, payouts, diffs
+HTTP  ──►  app/main.py          routes + auth dependencies + static mount
+                │
+                ├──►  app/auth.py       pbkdf2_hmac passwords, bearer tokens
+                ├──►  app/db.py         SQLAlchemy: users, sessions, app_state
+                │
+                └──►  app/workflow.py   the shared live world
+                        │               trips, locking, re-planning, scoped views
+                        ├──►  app/seed.py       deterministic dataset + demo accounts
+                        ├──►  app/solver.py     OR-Tools CP routing model   ─┐
+                        ├──►  app/baseline.py   naive greedy planner        ─┤ same
+                        │                                                    │ PlanResult
+                        └──►  app/metrics.py    metrics, deltas, payouts, diffs
                               ▲
-        app/models.py  pydantic schemas (domain + results + payloads)
+        app/models.py  pydantic schemas (domain + results + accounts + payloads)
         app/geo.py     haversine, 1.3 road factor, integer matrices
-        app/static/    single-page frontend (Leaflet map, Chart.js, no build step)
+        app/static/    login + farmer/driver/buyer views + coordinator dashboard
 ```
 
 | File | Responsibility |
@@ -74,8 +95,12 @@ HTTP  ──►  app/main.py          FastAPI: dataset CRUD, /plan, /disrupt, /r
 | `app/solver.py` | The OR-Tools model. See below. |
 | `app/baseline.py` | Greedy control group, returning the identical `PlanResult` shape. |
 | `app/metrics.py` | Metric roll-ups, signed solver-vs-baseline deltas, the farmer payout split, and plan diffing for disruptions. |
-| `app/main.py` | The HTTP surface, in-memory state, and the static mount. |
-| `app/static/` | The demo frontend: `index.html`, `app.js`, `style.css`. No framework, no build step, no npm — Leaflet and Chart.js come from pinned CDN URLs with SRI hashes. Served by the `StaticFiles` mount at `/`. |
+| `app/auth.py` | `hashlib.pbkdf2_hmac` password hashing, `secrets` bearer tokens, and the FastAPI header dependency. Standard library only. |
+| `app/db.py` | SQLAlchemy models and engine. SQLite by default, PostgreSQL when `DATABASE_URL` is set. |
+| `app/workflow.py` | The live world: trip lifecycle, the lock-aware re-planner, the background planning thread, the version counter, and every role-scoped view. **Access control lives here**, not in the browser. |
+| `app/main.py` | The HTTP surface, auth dependencies, and the static mount. |
+| `app/static/` | The frontend: `index.html` (shell + all views), `shell.js` (auth, routing, polling, farmer/driver/buyer views, i18n), `app.js` (the coordinator dashboard), `style.css`, `views.css`. No framework, no build step, no npm — Leaflet and Chart.js come from pinned CDN URLs with SRI hashes. |
+| `test_workflow.py` | Starts a real server against a throwaway database and drives the whole workflow over HTTP. |
 | `smoke_test.py` | Runs the whole pipeline with no server; prints the full report and verifies 35 checks. |
 
 ### The OR-Tools model
@@ -158,6 +183,147 @@ as specified.
 
 ---
 
+## Accounts and roles
+
+| Role | Sees | Demo accounts |
+|---|---|---|
+| **farmer** | only their own lots and match | `f01` … `f25`, and `kiran` |
+| **driver** | only their own trip | `t1` … `t4` (one per truck) |
+| **buyer** | only their own orders | `b1`, `b2`, `b3` |
+| **coordinator** | everything, plus the full dashboard | `admin` |
+
+Every demo account uses the password `demo123`. The login screen has one-click
+chips — **Kiran (new farmer)**, **Sunita (farmer)**, **T1–T4**, **Shakti Retail
+(buyer)**, **Coordinator** — so a demo never stalls on typing. Kiran Patil farms
+near Hingna and has **nothing posted**: the live demo is Kiran listing produce. Farmers can also self-register: name, village, phone,
+password, and a farm location picked by clicking the map.
+
+Passwords are hashed with `hashlib.pbkdf2_hmac` (SHA-256, 200 000 iterations,
+a fresh 16-byte salt each) and compared with `secrets.compare_digest`. Tokens
+are `secrets.token_urlsafe(32)`, stored in the `sessions` table, sent as
+`Authorization: Bearer <token>` and kept in `localStorage`. Every `/api` route
+except login and register needs one; `/health` stays open so a platform health
+check works.
+
+**Access is enforced on the server.** `/api/me/state` is assembled from the
+caller's own username, so a farmer's payload never contains another farmer's
+payout — there is nothing for the browser to filter. Endpoints that name a
+resource check the caller and return 403:
+
+```
+f02 → GET /api/farmers/F02    200   (their own lot)
+f02 → GET /api/farmers/F07    403   (another farmer's lot)
+f02 → GET /api/dataset        403   (coordinator only)
+t1  → POST /api/trips/T2/accept  403   (not their truck)
+```
+
+One deliberate nuance: a farmer's map shows their truck's whole route, because
+that is what the brief asks for, but the other growers on that truck are
+reduced to "Pickup 3" — no name, no quantity, no payout.
+
+---
+
+## Prices and matching
+
+A lot may ride a truck only if that truck's buyer **wants the crop and offers
+at least the farmer's `min_price_per_kg`**. The solver enforces both halves with
+the same `VehicleVar(index).SetValues(...)` restriction it already used for
+crop compatibility, so an unaffordable match is not discouraged by the
+objective; it is simply not in the search space. The baseline applies the
+identical rule (`_buyer_takes`), so the comparison stays fair.
+
+A lot no buyer will pay for never reaches the routing model. It comes back with
+reason code `price` and this message, rendered on the farmer's card with an
+**Edit price** button:
+
+> No buyer at your price. Best offer for tomato today: ₹26.10/kg. Your tomato
+> spoils at 13:00.
+
+Seeded minimums sit 12–30% below the *lowest* offer for their crop, except
+**F13** (potato), which is priced above every offer, so the coordinator's
+worklist shows the price case without anyone touching a phone.
+
+---
+
+## The three-sided workflow
+
+```
+farmer posts a lot (crop, kg, harvest, window, min price)  ->  re-plan
+planner proposes one trip per truck
+   farmer card:  "Match found — accept?"  buyer, ₹/kg, truck, ETA,
+                  net payout after transport, what a middleman would pay
+   driver card:  stops with ETA and kg, buyer, km, fee,
+                  per-stop badge "farmer confirmed" / "awaiting farmer"
+driver accepts + every farmer on the trip accepts   ->  CONFIRMED (locked)
+   buyer:        "Order confirmed — T2 on the way, ETA 11:11,
+                  tomato 783 kg + leafy greens 417 kg."
+   farmer:       "Confirmed — Truck T2 arrives ~09:14, sold to Shakti Retail
+                  Mart at ₹31.90/kg, you receive ₹8,205."
+```
+
+* **Seeded farmers are pre-accepted**; only live farmers tap Accept. A trip
+  carrying only seeded lots confirms the moment its driver accepts.
+* **Re-plans never touch a confirmed trip.** `_solver_input()` removes the
+  confirmed trucks, their lots and the buyer demand they cover; everything else
+  is planned and the locked routes are merged back unchanged.
+* **Re-plans are triggered** by posting a lot, editing a price, posting demand,
+  and any decline. They run on a background thread behind a lock; while one
+  runs every screen shows "Re-optimising…".
+* **A farmer decline withdraws the lot** (it stays on their screen, so they can
+  set a new price and re-post). **A driver decline** takes that truck out for
+  the round, and its lots go to other trucks or come back with a reason.
+* **If a re-plan changes an unconfirmed trip someone already accepted**, every
+  route has a fingerprint; when it changes, those acceptances are cleared and
+  the people involved get: *"Your trip changed — please review."*
+
+Notifications are stored per user: a bell with an unread count, and a toast
+when a new one arrives. Toasts never intercept a tap, so they cannot cover the
+Accept button on a phone.
+
+---
+
+## Live updates
+
+A server-side counter increments on every change. Each view polls
+`GET /api/me/state?since=<version>` every 3 seconds; when the version has not
+moved the server replies `{"changed": false}` with an empty payload and the
+browser re-renders nothing.
+
+Two browsers signed in as the same driver show the same trip, and an action in
+any account reaches every affected account within one poll. Measured inside
+each page from the moment of the tap, over three runs: the driver's screen
+flipped to Confirmed in 1.1–3.3 s and the buyer's "Order confirmed" toast
+arrived in 1.6–2.4 s.
+
+---
+
+## Persistence
+
+```bash
+# default: a SQLite file next to the app
+uvicorn app.main:app --reload
+
+# PostgreSQL
+DATABASE_URL=postgres://user:pass@host/db uvicorn app.main:app
+```
+
+A bare `postgres://` prefix (what several hosts still hand out) is rewritten to
+`postgresql+psycopg://` so the psycopg 3 driver is used. `KISANROUTE_DB_PATH`
+moves the SQLite file.
+
+Three tables: `users`, `sessions`, and `app_state` — a single row holding the
+planning world as JSON (farmers, buyers, trucks, the current plan, and every
+trip and stop status) next to the version counter. The world is saved after
+every change and loaded at startup; an empty database is seeded.
+
+Keeping the world as one JSON document rather than a dozen normalised tables is
+deliberate: the domain objects are already pydantic models that round-trip
+losslessly, every mutation is a whole-world update under one lock, and one
+process serves every session. Normalising it would buy nothing and cost the
+ability to hand the solver a `Dataset` directly.
+
+---
+
 ## Run it
 
 ```bash
@@ -168,32 +334,69 @@ pip install -r requirements.txt
 uvicorn app.main:app --reload
 ```
 
-Then open <http://127.0.0.1:8000/> for the status page, or
-<http://127.0.0.1:8000/docs> for interactive API docs.
+Open <http://127.0.0.1:8000/> and sign in — the one-click chips on the login
+screen cover a farmer, a driver, a buyer and the coordinator. Interactive API
+docs are at <http://127.0.0.1:8000/docs>.
+
+The first start creates `kisanroute.db`, seeds the dataset and the 34 demo
+accounts, and runs one plan. Delete that file to start over, or sign in as
+`admin` and press **Reset dataset**.
 
 Tested on Linux Mint / Python 3.12.3 with fastapi 0.142.2, uvicorn 0.54.0,
-pydantic 2.13.5, ortools 9.15.6755. Python 3.10+ is required.
+pydantic 2.13.5, ortools 9.15.6755, sqlalchemy 2.1.3, psycopg 3.3.6.
+Python 3.10+ is required.
 
-### Smoke test
+### Tests
 
 ```bash
-python smoke_test.py                      # 8 s solve, as specified
+python smoke_test.py                           # planners, 40 checks
 KISANROUTE_TIME_LIMIT=2 python smoke_test.py   # quick run
+python test_workflow.py                        # marketplace flow, 52 checks
+python test_workflow.py -v                     # also log every HTTP call
 ```
 
-It seeds the dataset, runs both planners, prints a side-by-side table of every
-metric plus every truck's route with arrival times and the full payout split,
-replays a truck breakdown, and verifies 35 checks — including that the
-optimiser never picks up a spoiled lot, never overloads a truck, never misses a
-buyer window, and beats the baseline on `total_km` and `kg_spoiled`. Exits
-non-zero on any failure.
+`smoke_test.py` touches no server and no database: it seeds the dataset, runs
+both planners, prints a side-by-side table of every metric plus every truck's
+route with arrival times and the full payout split, replays a truck breakdown,
+and verifies 40 checks — including that the optimiser never picks up a spoiled
+lot, never overloads a truck, never misses a buyer window, **never sells a lot
+below its farmer's minimum**, and beats the baseline on sellable produce,
+distance and cost per sellable unit, spoilage and farmer payout.
+
+`test_workflow.py` starts a real uvicorn server against a throwaway SQLite
+database and drives it over HTTP with the standard library — nothing is mocked.
+It covers login and rejected passwords, the 403s above, a lot priced above
+every offer coming back unmatched with the `price` reason, lowering the price
+getting it matched, a trip confirming only when the driver and every farmer
+accept, the buyer being notified, a confirmed trip surviving the next re-plan
+byte for byte, a farmer decline voiding a driver's acceptance (with the "Your
+trip changed" notice), a driver decline re-planning that truck's lots, the
+version counter, and two sessions of one driver agreeing.
+
+Both exit non-zero on any failure.
 
 ---
 
 ## The frontend
 
-`app/static/` is a single page with no build step: open `/` and it loads the
-dataset, runs both planners, and renders.
+`app/static/` is one page with no build step. `shell.js` owns login, routing by
+role and the 3-second poll; `app.js` owns the coordinator dashboard and is
+booted only once a coordinator signs in.
+
+**Farmer** — one big card (status, truck, ETA, buyer, price per kg, what they
+receive, and what a middleman would have paid), a map showing only their farm,
+their truck's route and the buyer, a "Post new produce" form, and a language
+toggle for **English / हिंदी / मराठी** covering every farmer-view label and all
+six crop names.
+
+**Driver** — their trip only: route map, ordered stops with the farmer's name,
+a tappable phone number, crop, kg and time, Accept / Decline, a "Picked up"
+button per stop and "Mark delivered". Large type, phone first.
+
+**Buyer** — incoming trucks with ETA, crops and kg, a map of the trucks heading
+to them, and a "Post demand" form.
+
+**Coordinator** — the original dashboard, unchanged, plus a live trip board:
 
 * **Headline tiles** — kg spoiled, extra rupees in farmers' hands, distance
   saved. Sized for a projector.
@@ -209,6 +412,9 @@ dataset, runs both planners, and renders.
   middleman comparison and the gain, sortable by any column, with a totals row.
 * **Disrupt bar** — fixed to the bottom: break a truck, cancel a buyer, or
   delay a harvest, then watch the re-plan diff and the animated route changes.
+* **Live trip board** — every truck's status (Proposed / Accepted / Declined /
+  In transit / Delivered) with its buyer, collected count, load, distance and
+  driver fee, refreshed by the same 3-second poll.
 
 Leaflet 1.9.4 and Chart.js 4.4.1 load from pinned CDN URLs with Subresource
 Integrity hashes. If either fails to load, the page says so in a banner and
@@ -220,51 +426,84 @@ from the browser console.
 
 ## API
 
-All JSON, CORS open. `GET /` serves the frontend from `app/static`.
+All JSON, CORS open. `GET /` serves the frontend from `app/static`. Every
+`/api` route except login and register needs `Authorization: Bearer <token>`.
 
-| Method | Path | Body | Returns |
+| Method | Path | Who | Returns |
 |---|---|---|---|
-| `GET` | `/health` | — | `{"status":"ok"}` |
-| `GET` | `/api/dataset` | — | farmers, buyers, trucks, crop catalogue, summary |
-| `POST` | `/api/farmers` | `FarmerCreate` | the created farmer + its spoilage deadline and pickup window |
-| `POST` | `/api/buyers` | `BuyerCreate` | the created buyer |
-| `POST` | `/api/plan` | `{"mode":"optimized"\|"baseline"\|"both","time_limit_seconds":8}` | plans + the metric comparison |
-| `POST` | `/api/disrupt` | `{"type":...,"target_id":...,"delay_minutes":...}` | new plan + diff against the previous one |
-| `POST` | `/api/reset` | `{"seed":42}` (optional) | re-seeded dataset summary |
+| `GET` | `/health` | anyone | `{"status","version","planning"}` |
+| `POST` | `/api/auth/login` | anyone | `{token, user}` |
+| `POST` | `/api/auth/register` | anyone | a new farmer account + token |
+| `POST` | `/api/auth/logout` | signed in | revokes the token |
+| `GET` | `/api/auth/me` | signed in | the current user |
+| `GET` | `/api/auth/demo-accounts` | anyone | the login screen's chips |
+| `GET` | `/api/me/state?since=N` | signed in | **the role-scoped payload every view polls** |
+| `POST` | `/api/me/lots` | farmer | lists produce (with `min_price_per_kg`), re-plans |
+| `POST` | `/api/me/lots/{lot}/accept` | that farmer | accepts the match |
+| `POST` | `/api/me/lots/{lot}/decline` | that farmer | withdraws the lot, re-plans |
+| `POST` | `/api/me/lots/{lot}/price` | that farmer | edits the minimum price, re-plans |
+| `POST` | `/api/me/notifications/read` | signed in | clears the bell |
+| `POST` | `/api/me/demand` | buyer | crop, offer ₹/kg, kg, window; re-plans |
+| `GET` | `/api/trips/{truck}` | driver, buyer, farmer on it, coordinator | that trip |
+| `POST` | `/api/trips/{truck}/accept` | that driver | driver's yes; confirms once every farmer agrees |
+| `POST` | `/api/trips/{truck}/decline` | that driver | drops out, re-plans |
+| `POST` | `/api/trips/{truck}/stops/{lot}/pickup` | that driver | marks a stop collected |
+| `POST` | `/api/trips/{truck}/deliver` | that driver | ends the trip |
+| `GET` | `/api/farmers/{lot}` | self or coordinator | one lot with its payout |
+| `GET` | `/api/dataset` | coordinator | farmers, buyers, trucks, crops |
+| `POST` | `/api/farmers`, `/api/buyers` | coordinator | add one directly |
+| `POST` | `/api/plan` | coordinator | plan now, honouring locked trips |
+| `POST` | `/api/disrupt` | coordinator | mutate, re-plan, diff |
+| `POST` | `/api/reset` | coordinator | re-seed the world (accounts stay) |
 
 ```bash
 curl -s localhost:8000/health
 
+# Sign in and keep the token
+TOKEN=$(curl -s -X POST localhost:8000/api/auth/login \
+  -H 'content-type: application/json' \
+  -d '{"username":"admin","password":"demo123"}' | python3 -c 'import json,sys;print(json.load(sys.stdin)["token"])')
+AUTH="Authorization: Bearer $TOKEN"
+
+# What this account may see, and the version to poll against
+curl -s -H "$AUTH" localhost:8000/api/me/state | head -c 400
+
 # Plan with both planners and get the full comparison
-curl -s -X POST localhost:8000/api/plan \
+curl -s -X POST localhost:8000/api/plan -H "$AUTH" \
   -H 'content-type: application/json' \
   -d '{"mode":"both","time_limit_seconds":8}' | head -c 400
 
+# A farmer lists produce; a driver accepts the trip they are offered
+curl -s -X POST localhost:8000/api/me/lots -H "$AUTH" \
+  -H 'content-type: application/json' \
+  -d '{"crop":"tomato","quantity_kg":220,"harvest_time":60}'
+curl -s -X POST localhost:8000/api/trips/T2/accept -H "$AUTH"
+
 # Add a farmer (times default to "cut now, 6 hours to collect")
-curl -s -X POST localhost:8000/api/farmers \
+curl -s -X POST localhost:8000/api/farmers -H "$AUTH" \
   -H 'content-type: application/json' \
   -d '{"name":"Nitin Raut","village":"Hingna","lat":21.07,"lng":79.00,
        "crop":"tomato","quantity_kg":240,"harvest_time":30}'
 
 # Add a buyer (price_per_kg may be omitted, a number, or a per-crop map)
-curl -s -X POST localhost:8000/api/buyers \
+curl -s -X POST localhost:8000/api/buyers -H "$AUTH" \
   -H 'content-type: application/json' \
   -d '{"name":"Wardha Exporters","type":"processor","lat":21.02,"lng":79.19,
        "crops_wanted":["orange","banana"],"demand_kg":1500,
        "window_start":240,"window_end":720}'
 
 # Disrupt and re-plan
-curl -s -X POST localhost:8000/api/disrupt \
+curl -s -X POST localhost:8000/api/disrupt -H "$AUTH" \
   -H 'content-type: application/json' \
   -d '{"type":"truck_breakdown","target_id":"T4"}'
-curl -s -X POST localhost:8000/api/disrupt \
+curl -s -X POST localhost:8000/api/disrupt -H "$AUTH" \
   -H 'content-type: application/json' \
   -d '{"type":"buyer_cancel","target_id":"B1"}'
-curl -s -X POST localhost:8000/api/disrupt \
+curl -s -X POST localhost:8000/api/disrupt -H "$AUTH" \
   -H 'content-type: application/json' \
   -d '{"type":"pickup_delay","target_id":"F07","delay_minutes":150}'
 
-curl -s -X POST localhost:8000/api/reset -H 'content-type: application/json' -d '{}'
+curl -s -X POST localhost:8000/api/reset -H "$AUTH" -H 'content-type: application/json' -d '{}'
 ```
 
 ### Disruptions
@@ -289,12 +528,14 @@ One web service, no database, no background worker.
 
 | Setting | Value |
 |---|---|
+| Root Directory | *(leave blank — the repo root holds `requirements.txt` and `app/`)* |
 | Environment | Python 3 |
 | Build Command | `pip install -r requirements.txt` |
 | Start Command | `uvicorn app.main:app --host 0.0.0.0 --port $PORT` |
 | Health Check Path | `/health` |
 | Instance Type | Free works; Starter is steadier for an 8 s solve |
 | Environment Variable | `PYTHON_VERSION = 3.12.3` |
+| Environment Variable | `DATABASE_URL` — a Render PostgreSQL URL, or leave unset for SQLite |
 
 Notes:
 
@@ -302,9 +543,14 @@ Notes:
   is marked unhealthy and redeployed in a loop.
 * **No `--reload` in production.** It doubles the process and watches files for
   nothing.
-* **One worker.** All state is in process memory, so a second worker would
-  serve a different dataset to every other request. Scale by running one
-  service, not by adding workers.
+* **One worker.** The planning world is held in memory and written back to the
+  database after each change; a second worker would keep its own copy and the
+  two would diverge. Scale by running one service, not by adding workers.
+* **Pick a database.** Without `DATABASE_URL` the service writes a SQLite file
+  to the container's ephemeral disk, so a redeploy starts from a fresh seed —
+  fine for a demo. Attach a Render PostgreSQL instance and set `DATABASE_URL`
+  (a bare `postgres://` prefix is rewritten automatically) to keep accounts and
+  trips across deploys.
 * **Free-tier CPU is shared**, so an 8-second guided local search explores less
   than it does locally. The plan is still valid — `PATH_CHEAPEST_ARC` produces
   a feasible solution within milliseconds and everything after that is
@@ -352,5 +598,13 @@ Constants worth knowing, all in `app/solver.py`:
   roads. Swapping in a real matrix means replacing one function in `app/geo.py`.
 * **Unloading at the buyer is instantaneous.** Only the 15 min farmer service
   time is modelled, as specified.
-* **State is in process memory.** A restart re-seeds. That is a deliberate
-  choice for a single-service deployment, not an oversight.
+* **One process owns the world.** Every mutation runs under a single lock and
+  the whole planning world is rewritten on each change. That is right for one
+  service and a few dozen trucks, and it is the first thing to replace if this
+  ever needed to scale horizontally.
+* **A declined truck stays out until Reset.** Declining is a decision about the
+  day, not about one round, so the truck is not quietly re-offered the next
+  time a farmer posts a lot.
+* **The baseline is not lock-aware.** It re-plans the whole day from scratch
+  every time, because it is the "what if nobody optimised anything" control.
+  Making it respect accepted trips would flatter the comparison.
